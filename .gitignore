@@ -1,0 +1,8 @@
+node_modules/
+target/
+tools/whisper/
+tools/models/
+generated-images/
+.workbuddy/
+*.log
+ui-shots/

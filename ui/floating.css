@@ -1,0 +1,140 @@
+/* ============ VCC 悬浮窗 — 右上角 Liquid Glass ============ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, "SF Pro Text", "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+#float-card {
+  margin: 8px 10px;
+  padding: 13px 15px 14px;
+  border-radius: 20px;
+  position: relative;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 248, 252, 0.88));
+  backdrop-filter: blur(32px) saturate(1.6);
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.26),
+    0 2px 12px rgba(0, 0, 0, 0.1);
+  opacity: 0;
+  transform: translateY(-8px) scale(0.97);
+  transition: opacity 0.42s cubic-bezier(0.32, 0.72, 0, 1),
+              transform 0.42s cubic-bezier(0.32, 0.72, 0, 1);
+}
+/* 顶亮发丝边（光从上方来） */
+#float-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(168deg,
+    rgba(255, 255, 255, 0.95),
+    rgba(255, 255, 255, 0.35) 34%,
+    rgba(255, 255, 255, 0.18) 62%,
+    rgba(255, 255, 255, 0.55));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+/* 顶部镜面高光 */
+#float-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.5), transparent 22%);
+  pointer-events: none;
+}
+#float-card > * { position: relative; z-index: 1; }
+
+#float-card.show { opacity: 1; transform: none; }
+#float-card.fade { opacity: 0; transform: translateY(-10px) scale(0.97); }
+
+.f-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+.f-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #34c759;
+  box-shadow: 0 0 7px rgba(52, 199, 89, 0.7);
+  animation: f-pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+.f-dot.busy {
+  background: linear-gradient(135deg, #c959dd, #ff9004);
+  box-shadow: 0 0 8px rgba(201, 89, 221, 0.55);
+}
+@keyframes f-pulse { 50% { opacity: 0.4; } }
+.f-title { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; color: rgba(0, 0, 0, 0.42); }
+.f-state {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.38);
+}
+
+/* 执行步骤列表 */
+#f-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 250px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+.f-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 450;
+  color: rgba(0, 0, 0, 0.74);
+  animation: f-in 0.34s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.f-step .s-ico {
+  flex-shrink: 0;
+  width: 17px; height: 17px;
+  display: grid; place-items: center;
+}
+.f-step .s-ico svg { width: 15px; height: 15px; display: block; }
+.f-step.running { color: rgba(0, 0, 0, 0.82); }
+.f-step.running .s-ico { color: rgba(0, 0, 0, 0.85); }
+.f-step.running .s-spin { animation: f-spin 0.85s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+.f-step.done .s-ico { color: rgba(0, 0, 0, 0.88); }
+.f-step.fail { color: rgba(0, 0, 0, 0.35); }
+.f-step.fail .s-ico { color: rgba(0, 0, 0, 0.35); }
+.f-step .s-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes f-spin { to { transform: rotate(360deg); } }
+@keyframes f-in {
+  from { opacity: 0; transform: translateX(-7px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* AI 回答文本 */
+#f-text {
+  margin-top: 8px;
+  padding-top: 9px;
+  border-top: 0.5px solid rgba(0, 0, 0, 0.08);
+  font-size: 13px;
+  line-height: 1.55;
+  color: rgba(0, 0, 0, 0.86);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0,0,0,.18) transparent;
+}
+#f-text.hidden { display: none; }

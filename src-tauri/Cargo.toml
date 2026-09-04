@@ -1,0 +1,50 @@
+[package]
+name = "voice-control-for-class"
+version = "0.5.0"
+description = "LLM-powered voice agent for classroom PC control"
+edition = "2021"
+
+[lib]
+name = "vcc_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+enigo = "0.2"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+# Local patch: transparent windows use WS_EX_NOREDIRECTIONBITMAP instead of
+# legacy DWM blur-behind glass (which renders as a grey frosted ring on Win11).
+# See scripts/patch-tao.py for the two-line change.
+[patch.crates-io]
+tao = { path = "../vendor/tao-0.35.3" }

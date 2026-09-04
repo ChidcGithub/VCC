@@ -1,0 +1,8 @@
+feat(tools): read_screen 第 20 工具——UIA 无障碍树让 DeepSeek 看见屏幕并点击
+
+DeepSeek 是纯文本模型，截图对它无用。新增 read_screen：
+- dump 前台/指定窗口可交互元素（名称/角色/中心坐标，阅读顺序编号）
+- window=all 列出全部可见顶层窗口；标题关键字直达（最小化自动还原）
+- 前台是 VCC 自己时回退窗口列表，避免读到自身
+- 2000 节点/44 元素预算，输出截 1500 字内；system prompt 增加看→点规则
+- 测试 9/9：UIA 窗口列表/前台 dump 冒烟 + enigo Abs 坐标系一致性（±2px）

@@ -1,0 +1,731 @@
+/* ============ VCC 主窗口 — 黑白极简（Premium Mono）============ */
+/* 彩色光环已移至全屏 overlay（WebGL）；本窗口只靠材质、留白与层次表达状态 */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --card-radius: 14px;
+  --text: rgba(255, 255, 255, 0.92);
+  --text-dim: rgba(255, 255, 255, 0.55);
+  --text-faint: rgba(255, 255, 255, 0.34);
+  --hairline: rgba(255, 255, 255, 0.09);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, "SF Pro Text", "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* 截图预览背景（Tauri 内不可见，?demo= 时生效） */
+body.preview {
+  background: radial-gradient(900px 700px at 28% 12%, #26262c, #121216 55%, #0a0a0e);
+}
+
+/* ---------- 全窗噪点（已移除：mix-blend-mode 在透明窗口上强制黑色垫底，
+   导致卡片四周出现深灰环；防色带由 shader 抖动与柔影替代） ---------- */
+
+/* ---------- Liquid Glass 卡片（纯黑白） ---------- */
+.card {
+  position: absolute;
+  inset: 26px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--card-radius);
+  /* 透明窗口内 backdrop-filter 无内容可模糊（只会惹合成问题），用更高 alpha 补玻璃深度 */
+  background: linear-gradient(180deg, rgba(27, 27, 31, 0.88), rgba(12, 12, 15, 0.94));
+  /* 不画黑色投影：26px 余量装不下 40px 阴影，在浅色桌面上就是一圈灰晕；
+     立体感交给发丝边 + 白色呼吸光 */
+  box-shadow: none;
+  overflow: hidden;
+  transition: box-shadow 0.6s ease;
+}
+/* 渐变发丝边：顶亮底暗（光从上方来） */
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(168deg,
+    rgba(255, 255, 255, 0.26),
+    rgba(255, 255, 255, 0.07) 32%,
+    rgba(255, 255, 255, 0.02) 58%,
+    rgba(255, 255, 255, 0.1));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 2;
+}
+/* 顶部镜面高光 */
+.card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 16%);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* 状态表达 = 白色能量的强弱，仅此而已（黑色投影已移除：透明窗口内会晕成灰框） */
+body.listening .card { box-shadow: 0 0 44px rgba(255, 255, 255, 0.055); }
+body.thinking  .card { box-shadow: 0 0 44px rgba(255, 255, 255, 0.045); }
+body.executing .card { box-shadow: 0 0 60px rgba(255, 255, 255, 0.075); }
+/* 完成绽放：与全屏光环的 done 阶段同步呼吸 */
+body.done .card { box-shadow: 0 0 68px rgba(255, 255, 255, 0.10); }
+
+/* 呼出入场：卡片从下方轻弹入（热键呼出的仪式感） */
+body.summon .card { animation: card-summon 0.52s var(--ease-out); }
+@keyframes card-summon {
+  from { opacity: 0.35; transform: translateY(16px) scale(0.965); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---------- 头部 ---------- */
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 15px 16px 9px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 3;
+}
+.brand { display: flex; align-items: center; gap: 7px; }
+.pulse-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.5);
+  animation: pulse 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+body.listening .pulse-dot,
+body.recording .pulse-dot {
+  background: #fff;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.85);
+}
+@keyframes pulse { 50% { opacity: 0.4; } }
+.brand-name { font-weight: 650; font-size: 13.5px; letter-spacing: 0.05em; color: var(--text); }
+.hint { flex: 1; font-size: 11px; color: var(--text-faint); text-align: center; letter-spacing: 0.02em; }
+.header-actions { display: flex; gap: 2px; }
+.ghost-btn {
+  width: 26px; height: 26px;
+  border: none; border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s, transform 0.12s;
+}
+.ghost-btn:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
+.ghost-btn:active { transform: scale(0.92); }
+
+/* ---------- 对话流 ---------- */
+#chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 15px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  transition: opacity 0.24s ease, transform 0.24s ease;
+}
+/* 新对话：旧内容轻柔下沉淡出 */
+#chat.clearing { opacity: 0; transform: translateY(6px); pointer-events: none; }
+#chat::-webkit-scrollbar { width: 3.5px; }
+#chat::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.05); border-radius: 2px; transition: background 0.25s; }
+#chat:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); }
+
+.bubble {
+  max-width: 86%;
+  padding: 9px 13px;
+  font-size: 13.5px;
+  line-height: 1.58;
+  color: var(--text);
+  word-break: break-word;
+  user-select: text;
+  animation: bubble-in 0.42s var(--ease-out);
+  white-space: pre-wrap;
+}
+/* 用户气泡：纯白反转（黑底上唯一的大面积白，视觉锚点） */
+.bubble.user {
+  align-self: flex-end;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0d0d10;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+  border-radius: 17px 17px 5px 17px;
+}
+.bubble.ai {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.075);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.055);
+  border-radius: 17px 17px 17px 5px;
+}
+.bubble.err {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 92%;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.72);
+  border-radius: 14px;
+  font-size: 12.5px;
+}
+.err-text { flex: 1; user-select: text; }
+.retry-chip {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 11.5px;
+  font-family: inherit;
+  font-weight: 600;
+  color: #0d0d10;
+  background: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  transition: transform 0.12s, opacity 0.15s;
+}
+.retry-chip:hover { opacity: 0.85; }
+.retry-chip:active { transform: scale(0.94); }
+
+.bubble.ai code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.bubble.ai b { font-weight: 650; color: #fff; }
+
+/* 工具执行行 */
+.tool-line {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 88%;
+  padding: 6px 11px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.055);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
+  font-size: 12px;
+  color: var(--text-dim);
+  animation: bubble-in 0.32s var(--ease-out);
+}
+.tool-line .t-ico { font-size: 12px; }
+.tool-line .t-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tool-line .t-ms {
+  margin-left: auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  min-width: 34px;
+  text-align: right;
+}
+.tool-line.fail .t-ms { opacity: 0.6; }
+.tool-line.running .t-ico { animation: spin-ico 0.9s linear infinite; }
+.tool-line.done { color: rgba(255, 255, 255, 0.8); }
+.tool-line.done .t-ico { animation: none; color: rgba(255, 255, 255, 0.95); }
+.tool-line.fail { color: rgba(255, 255, 255, 0.42); }
+.tool-line.fail .t-ico { animation: none; color: rgba(255, 255, 255, 0.42); }
+
+@keyframes spin-ico { to { transform: rotate(360deg); } }
+@keyframes bubble-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 对话分隔线：历史恢复 / 记忆更新提示 */
+.chat-divider {
+  align-self: center;
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  padding: 3px 0 0;
+  user-select: none;
+  animation: bubble-in 0.42s var(--ease-out);
+}
+
+/* ---------- 空状态：欢迎 + 快捷指令 ---------- */
+#empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px 0 4px;
+  animation: bubble-in 0.5s var(--ease-out);
+}
+#empty-state.hidden { display: none; }
+body.preview #empty-state { display: none; }
+.es-logo {
+  font-size: 30px;
+  /* 彩色 emoji 转纯白：黑白极简体系内不引入杂色 */
+  filter: grayscale(1) brightness(2.1) drop-shadow(0 0 18px rgba(255, 255, 255, 0.35));
+  animation: es-breathe 3.2s ease-in-out infinite;
+}
+@keyframes es-breathe { 50% { opacity: 0.55; transform: scale(0.94); } }
+.es-title { font-size: 16px; font-weight: 650; color: var(--text); letter-spacing: 0.02em; }
+.es-sub { font-size: 12px; color: var(--text-faint); margin-bottom: 14px; }
+.es-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  max-width: 300px;
+}
+.chip {
+  border: none;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, transform 0.12s;
+}
+.chip:hover { background: rgba(255, 255, 255, 0.12); color: var(--text); }
+.chip:active { transform: scale(0.95); }
+
+/* ---------- 设置面板分组标题 ---------- */
+.group-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+  padding-top: 10px;
+  border-top: 0.5px solid var(--hairline);
+  margin-top: 2px;
+}
+.group-title.first { border-top: none; padding-top: 0; }
+
+.voice-status {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 2px 2px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 设置面板滚动条：hover 显现 */
+.settings::-webkit-scrollbar { width: 3.5px; }
+.settings::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.05); border-radius: 2px; transition: background 0.25s; }
+.settings:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); }
+
+/* ---------- 悬浮识别文字（白色流光字） ---------- */
+#live-transcript {
+  flex-shrink: 0;
+  margin: 0 18px 6px;
+  padding: 7px 13px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-align: center;
+  background: linear-gradient(100deg, #ffffff 32%, rgba(255, 255, 255, 0.55) 46%, #ffffff 60%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 14px rgba(255, 255, 255, 0.18));
+  animation: transcript-in 0.45s var(--ease-out), shimmer 3.4s linear infinite;
+}
+#live-transcript.hidden { display: none; }
+@keyframes transcript-in {
+  from { opacity: 0; filter: blur(8px); transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes shimmer {
+  from { background-position: 130% 0; }
+  to { background-position: -130% 0; }
+}
+
+/* ---------- 状态行 ---------- */
+#phase-line {
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  padding: 0 0 7px;
+  min-height: 20px;
+  transition: color 0.35s ease, opacity 0.35s ease;
+}
+#phase-line.empty { opacity: 0; }
+body.listening #phase-line { color: rgba(255, 255, 255, 0.88); }
+body.thinking  #phase-line {
+  /* Apple 生成中 shimmer：灰底白光扫过（AIGeneratingText 语义的黑白化） */
+  background: linear-gradient(100deg,
+    rgba(255, 255, 255, 0.30) 42%,
+    rgba(255, 255, 255, 0.95) 50%,
+    rgba(255, 255, 255, 0.30) 58%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+body.executing #phase-line { color: rgba(255, 255, 255, 0.92); }
+@keyframes shimmer { to { background-position: -220% 0; } }
+
+/* ---------- 输入条 ---------- */
+footer {
+  flex-shrink: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 14px 14px;
+  padding: 7px 8px 7px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(18px) saturate(1.3);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+footer::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 0.5px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.03));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+/* ---------- 输入条 Apple Intelligence 扫光 ----------
+   AI 工作中（thinking/executing/done）：七色光弧沿胶囊边框流动。
+   @property 注册角度才能参与 transition/animation（Chromium 85+）。 */
+@property --ga {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+footer::after {
+  content: "";
+  position: absolute;
+  inset: -0.5px;
+  border-radius: inherit;
+  padding: 1.2px;
+  background: conic-gradient(from var(--ga),
+    transparent 0deg,
+    #8d9fff 52deg, #c686ff 88deg, #bc82f3 118deg,
+    #f5b9ea 148deg, #ffba71 180deg, #ff6778 212deg, #aa6eee 244deg,
+    transparent 292deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.55s ease;
+  pointer-events: none;
+}
+/* 外圈柔光：环带外移 + 环带式 mask（先裁带后 blur），避免光渗入胶囊内部 */
+footer .glow-under {
+  position: absolute;
+  inset: -6px;
+  border-radius: 999px;
+  padding: 3px;
+  background: conic-gradient(from var(--ga),
+    transparent 20deg,
+    rgba(141, 159, 255, 0.38) 60deg, rgba(198, 134, 255, 0.38) 95deg,
+    rgba(188, 130, 243, 0.38) 122deg, rgba(245, 185, 234, 0.38) 150deg,
+    rgba(255, 186, 113, 0.38) 182deg, rgba(255, 103, 120, 0.38) 214deg,
+    rgba(170, 110, 238, 0.38) 248deg,
+    transparent 288deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  filter: blur(6px);
+  opacity: 0;
+  transition: opacity 0.55s ease;
+  pointer-events: none;
+}
+body.thinking  footer::after,
+body.executing footer::after,
+body.done      footer::after {
+  opacity: 1;
+  animation: edge-flow 2.8s linear infinite;
+}
+body.thinking  footer .glow-under,
+body.executing footer .glow-under,
+body.done      footer .glow-under {
+  opacity: 0.5;
+  animation: edge-flow 2.8s linear infinite;
+}
+/* done：光弧加速一圈，与光环 done 绽放同步后熄灭 */
+body.done footer::after { animation-duration: 1.6s; }
+body.done footer .glow-under { animation-duration: 1.6s; }
+@keyframes edge-flow { to { --ga: 360deg; } }
+#btn-mic {
+  width: 30px; height: 30px;
+  flex-shrink: 0;
+  border: none; border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: grid; place-items: center;
+  transition: background 0.18s, color 0.18s, box-shadow 0.18s;
+}
+#btn-mic:hover { color: var(--text); background: rgba(255, 255, 255, 0.1); }
+/* 录音态：白色脉冲（黑白体系里最大的动效张力） */
+body.recording #btn-mic {
+  color: #0d0d10;
+  background: #ffffff;
+  animation: mic-ring 1.5s ease-out infinite;
+}
+@keyframes mic-ring {
+  70% { box-shadow: 0 0 0 9px rgba(255, 255, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+}
+#input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13.5px;
+  color: var(--text);
+  font-family: inherit;
+}
+#input::placeholder { color: var(--text-faint); }
+#btn-send {
+  width: 30px; height: 30px;
+  flex-shrink: 0;
+  border: none; border-radius: 50%;
+  background: #ffffff;
+  color: #0d0d10;
+  cursor: pointer;
+  display: grid; place-items: center;
+  transition: opacity 0.15s, transform 0.12s, box-shadow 0.15s;
+}
+#btn-send:hover { box-shadow: 0 0 16px rgba(255, 255, 255, 0.3); }
+#btn-send:active { transform: scale(0.92); }
+#btn-send:disabled { opacity: 0.35; }
+
+/* ---------- 设置面板 ---------- */
+.settings {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  background: rgba(11, 11, 14, 0.92);
+  backdrop-filter: blur(40px) saturate(1.4);
+  animation: settings-in 0.3s var(--ease-out);
+}
+.settings.hidden { display: none; }
+/* AI 长期记忆区块 */
+.mem-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.mini-link {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 2px 7px;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s;
+}
+.mini-link:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+.settings textarea {
+  border: none;
+  border-radius: 9px;
+  padding: 8px 11px;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.09);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.55;
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  user-select: text;
+  transition: box-shadow 0.2s;
+}
+.settings textarea:focus {
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.12), 0 0 0 1.5px rgba(255, 255, 255, 0.65);
+}
+.settings textarea::placeholder { color: var(--text-faint); }
+#cfg-memory {
+  border: none;
+  border-radius: 9px;
+  padding: 8px 11px;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.09);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.55;
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  min-height: 64px;
+  max-height: 140px;
+  user-select: text;
+  transition: box-shadow 0.2s;
+}
+#cfg-memory:focus {
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.12), 0 0 0 1.5px rgba(255, 255, 255, 0.65);
+}
+#cfg-memory::placeholder { color: var(--text-faint); }
+@keyframes settings-in { from { opacity: 0; transform: scale(0.98); } }
+.settings-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 15px; font-weight: 650; color: var(--text);
+}
+.settings label {
+  display: flex; flex-direction: column; gap: 5px;
+  font-size: 11.5px; color: var(--text-dim);
+}
+.settings input {
+  height: 34px;
+  border: none;
+  border-radius: 9px;
+  padding: 0 11px;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.09);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  user-select: text;
+  transition: box-shadow 0.2s;
+}
+.settings select.cfg-select {
+  height: 34px;
+  border: none;
+  border-radius: 9px;
+  padding: 0 8px;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.09);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, rgba(255,255,255,0.55) 50%),
+    linear-gradient(135deg, rgba(255,255,255,0.55) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 15px, calc(100% - 11px) 15px;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+.settings select.cfg-select option { background: #16161a; color: var(--text); }
+.settings select.cfg-select:focus {
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.12), 0 0 0 1.5px rgba(255, 255, 255, 0.65);
+}
+.settings input:focus {
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.12), 0 0 0 1.5px rgba(255, 255, 255, 0.65);
+}
+/* 开关行（黑白 iOS toggle） */
+.settings label.cfg-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.settings input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.18s;
+}
+.settings input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.85);
+  transition: transform 0.18s var(--ease-out), background 0.18s;
+}
+.settings input[type="checkbox"]:checked { background: #ffffff; }
+.settings input[type="checkbox"]:checked::after { transform: translateX(14px); background: #0d0d10; }
+.settings input[type="checkbox"]:focus-visible {
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.65);
+}
+.settings-foot {
+  margin-top: auto;
+  display: flex; justify-content: space-between; align-items: center;
+}
+#settings-status { font-size: 11.5px; color: rgba(255, 255, 255, 0.85); }
+.ver-line {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.38);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  margin-right: 14px;
+}
+#btn-save-settings {
+  height: 34px; padding: 0 22px;
+  border: none; border-radius: 999px;
+  background: #ffffff;
+  color: #0d0d10; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.12s;
+}
+#btn-save-settings:active { opacity: 0.8; transform: scale(0.97); }
+
+/* ---------- 无障碍：减少动态 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot, #live-transcript, body.thinking #phase-line, body.recording #btn-mic,
+  footer::after, footer .glow-under {
+    animation: none;
+  }
+  body.thinking #phase-line {
+    color: rgba(255, 255, 255, 0.7);
+    background: none;
+    -webkit-background-clip: initial;
+    background-clip: initial;
+  }
+  body.thinking footer::after, body.executing footer::after, body.done footer::after { opacity: 0.85; }
+  .bubble, .tool-line { animation-duration: 0.01s; }
+  .card, #phase-line { transition: none; }
+}
