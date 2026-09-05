@@ -1,8 +1,8 @@
-mod config;
-mod llm;
-mod memory;
-mod tools;
-mod voice;
+pub mod config;
+pub mod llm;
+pub mod memory;
+pub mod tools;
+pub mod voice;
 
 use llm::ChatMessage;
 use std::sync::Mutex;

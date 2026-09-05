@@ -6,3 +6,6 @@ generated-images/
 .workbuddy/
 *.log
 ui-shots/
+
+# stash 事故残留（objects 已损毁，无恢复价值）
+.git-broken-backup/

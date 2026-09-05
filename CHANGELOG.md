@@ -6,6 +6,10 @@
 
 ### 功能
 
+- **屏幕文字 OCR（ocr_screen，第 21 个工具）**：Windows.Media.Ocr（系统自带、免费、中文语言包优先）识别屏幕/指定窗口里的文字——UIA 读不到的图片、PPT 缩略图、自绘界面的兜底方案；截图与识别在运行时经 Windows Runtime 完成，不静态链接 api-ms-win-core-winrt（部分受限环境的 loader 解析不了它，进程 0xC0000139）
+- **AI 自定义弹窗（show_dialog，第 22 个工具）**：模型自定义标题/正文/按钮（normal/primary/danger 三种样式，1-4 个），样式与主窗一致（暗色玻璃 + SF 字体栈 + 发丝边）；Agent 阻塞等待用户点选并拿到结果，超时/Esc/Alt+F4 均优雅收尾；需要确认、授权、二选一时不再自问自答
+- **剪贴板读写（clipboard，第 23 个工具）**：get/set 文本；「帮我复制这段」「念一下我刚复制的内容」闭环
+- **测试基建迁移**：全部测试统一挂 bin target（`[lib] test = false`）——lib 测试 exe 的部分系统 DLL import 在受限环境 loader 解析失败（0xC0000139），bin 链接路径不受影响；测试 11/11（含真实 whisper 推理、UIA、OCR 全屏识别、剪贴板 roundtrip）
 - **屏幕视觉（read_screen，第 20 个工具）**：DeepSeek 看不了截图，改用 Windows UI Automation 把前台/指定窗口的可点击元素（按钮/菜单/输入框）连同中心坐标 dump 成结构化文本——配合已有 mouse_click/type_text/press_hotkey，模型首次真正"看得见、点得动"任意应用界面；前台是 VCC 自己时自动退回可见窗口列表
 - **修复：中文/空格路径下语音识别必然失败**——whisper 二进制按 UTF-8 解释 argv，仓库路径含「高二」等中文时模型加载直接 fail-fast（0xC0000409），报错只剩一行 `load_backend`。现改为 cwd=models + 纯 ASCII 相对文件名传入（server 与 CLI 同修）；wav 临时路径含非 ASCII 时自动落相对名兜底
 - **whisper 故障可诊断**：server stderr 落盘 `whisper-server.log`（原为静默丢弃）；server 启动即退出时秒级报错并附日志尾部（原傻等 30s）；CLI 失败信息带退出码 + 日志尾部

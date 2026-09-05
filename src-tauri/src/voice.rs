@@ -356,7 +356,7 @@ async fn infer_via_server(cfg: &crate::config::Config, port: u16, wav_path: &Pat
 
 /* ---------- CLI 兜底 ---------- */
 
-async fn infer_via_cli(cfg: &crate::config::Config, wav_path: &Path) -> Result<String, String> {
+pub async fn infer_via_cli(cfg: &crate::config::Config, wav_path: &Path) -> Result<String, String> {
     let dir = whisper_dir().ok_or("未找到 tools/whisper/Release/")?;
     let (models_cwd, model_name) = model_dir_and_name(&cfg.voice_model)
         .ok_or("未找到语音模型文件（tools/models/）")?;
@@ -494,28 +494,4 @@ pub fn probe_env() -> Result<String, String> {
         quality,
         SERVER_PORT.load(Ordering::Relaxed)
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 回归：模型以 cwd=models + 相对名传入（绝对路径含中文会让 whisper fail-fast 崩溃）
-    #[test]
-    fn cli_transcribe_nonascii_repo() {
-        let cfg = crate::config::Config::default();
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().to_path_buf();
-        let src = repo.join("tools/tests/syn-3s.wav");
-        if !src.exists() {
-            return; // 无测试音频时跳过
-        }
-        // 拷到 %TEMP%（ASCII 路径）模拟真实录音临时文件
-        let tmp = std::env::temp_dir().join("vcc_test_cli_reg.wav");
-        std::fs::copy(&src, &tmp).unwrap();
-        let t = tauri::async_runtime::block_on(infer_via_cli(&cfg, &tmp));
-        let _ = std::fs::remove_file(&tmp);
-        let t = t.expect("whisper CLI 推理应成功");
-        assert!(!t.trim().is_empty(), "whisper CLI 应返回非空文本");
-    }
 }

@@ -17,6 +17,8 @@ function Await($Op, [Type]$ResultType) {
 [void][Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
 [void][Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
 [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+[void][Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
+[void][Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType = WindowsRuntime]
 
 # Partial screen capture
 $b = New-Object System.Drawing.Bitmap $W, $H

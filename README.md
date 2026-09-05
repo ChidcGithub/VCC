@@ -33,7 +33,7 @@
 - **流式回答**：SSE 打字机效果，等待感减半
 - **右上角悬浮小窗**：AI 回答与执行步骤实时显示（黑白状态体系），完成后 5 秒自动淡出
 - **朗读 AI 回答**（可选）：投影课堂学生听得到回答，WebView2 原生 TTS，新指令自动打断
-- **系统控制工具**（20 个）：音量 / 相对调节（「大点声」） / 静音、亮度、鼠标移动 / 点击 / 拖动 / 滚轮、打字 / 组合键、屏幕元素读取（read_screen）、
+- **系统控制工具**（23 个）：音量 / 相对调节（「大点声」） / 静音、亮度、鼠标移动 / 点击 / 拖动 / 滚轮、打字 / 组合键、屏幕元素读取（read_screen）、屏幕文字 OCR（ocr_screen）、AI 自定义弹窗（show_dialog）、剪贴板读写（clipboard）、
   文件浏览 / 读取 / 写入 / 搜索、打开应用 / 路径 / 网址、全屏截图、PowerShell 命令（删除 / 格式化 / 关机类自动拦截）
 - **无障碍**：尊重系统「减少动态」设置（prefers-reduced-motion）
 
@@ -70,7 +70,7 @@ WebView2 三窗口的共享运行时（约 100MB/进程为 Chromium 内核基线
 ├── src-tauri/src/      # Rust 后端
 │   ├── lib.rs          # 应用入口：双窗口、托盘、全局热键、命令
 │   ├── llm.rs          # DeepSeek function calling Agent 循环（SSE 流式）
-│   ├── tools.rs        # 20 个系统控制工具
+│   ├── tools.rs        # 23 个系统控制工具
 │   ├── voice.rs        # whisper-server 常驻 + CLI 兜底
 │   ├── memory.rs       # 对话历史持久化 + AI 长期记忆
 │   └── config.rs       # 配置读写
