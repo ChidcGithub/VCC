@@ -173,8 +173,7 @@ pub fn run() {
             hide_main,
             set_autostart,
             set_always_on_top,
-            voice::probe_env,
-            dialog_ready
+            voice::probe_env
         ])
         .run(tauri::generate_context!())
         .expect("VCC 启动失败");
@@ -385,14 +384,6 @@ fn setup_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 弹窗结果桥：dialog.js emit("vcc://dialog-result") → 转发给当前等待中的 show_dialog 工具
-    app.listen("vcc://dialog-result", |ev| {
-        let payload = ev.payload().to_string();
-        if let Some(tx) = tools::DIALOG_RESULT_TX.lock().unwrap().as_ref() {
-            let _ = tx.send(payload);
-        }
-    });
-
     Ok(())
 }
 
@@ -585,11 +576,3 @@ fn set_always_on_top(app: AppHandle, on: bool) {
     }
 }
 
-/// 弹窗页面就绪：补发本次弹窗参数（防 emit 先于 JS listen 的竞态）
-#[tauri::command]
-fn dialog_ready(app: AppHandle) {
-    use tauri::Emitter;
-    if let Some(p) = tools::DIALOG_PAYLOAD.lock().unwrap().as_ref() {
-        let _ = app.emit_to("dialog", "vcc://dialog-set", p.clone());
-    }
-}

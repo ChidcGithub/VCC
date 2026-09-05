@@ -460,17 +460,26 @@ pub async fn ocr_screen(window_kw: &str) -> ToolResult {
     Ok(format!("OCR（{w}x{h}px，{lines} 行）：\n{shown}"))
 }
 
-/* ================= AI 自定义弹窗（样式与主窗一致，回传用户选择） ================= */
+/* ================= AI 自定义弹窗（Win32 原生 TaskDialog，回传用户选择） ================= */
 
-/// dialog.js emit("vcc://dialog-result") 的转发桥（lib.rs setup 写入）
-pub static DIALOG_RESULT_TX: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
-    std::sync::Mutex::new(None);
-/// dialog_ready command 补发的 payload（防 emit 竞态）
-pub static DIALOG_PAYLOAD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// 弹窗参数（模型 JSON → 结构化，含截断/缺省/校验）
+#[derive(Clone, Debug)]
+pub struct DialogParams {
+    pub title: String,
+    pub body: String,
+    pub buttons: Vec<String>,
+    pub default_idx: usize,
+    pub warn_icon: bool,
+    pub info_icon: bool,
+    pub timeout_secs: u64,
+}
 
-pub fn dialog_payload(v: &Value) -> Result<(String, u64), String> {
+pub fn dialog_params(v: &Value) -> Result<DialogParams, String> {
     let take = |s: &str, n: usize| s.chars().take(n).collect::<String>();
-    let title = take(v.get("title").and_then(|x| x.as_str()).unwrap_or("提示").trim(), 40);
+    let title = take(
+        v.get("title").and_then(|x| x.as_str()).unwrap_or("提示").trim(),
+        40,
+    );
     let body = take(
         v.get("body").and_then(|x| x.as_str()).unwrap_or("").trim(),
         600,
@@ -478,7 +487,10 @@ pub fn dialog_payload(v: &Value) -> Result<(String, u64), String> {
     if body.is_empty() {
         return Err("缺少 body（弹窗正文）".into());
     }
-    let mut buttons: Vec<(String, String)> = Vec::new();
+    let mut buttons: Vec<String> = Vec::new();
+    let mut has_primary = false;
+    let mut has_danger = false;
+    let mut primary_idx: Option<usize> = None;
     if let Some(arr) = v.get("buttons").and_then(|x| x.as_array()) {
         for b in arr.iter().take(4) {
             let label = b
@@ -489,101 +501,205 @@ pub fn dialog_payload(v: &Value) -> Result<(String, u64), String> {
             if label.trim().is_empty() {
                 continue;
             }
-            let style = b
-                .get("style")
-                .and_then(|x| x.as_str())
-                .unwrap_or("normal")
-                .to_string();
-            buttons.push((take(label.trim(), 12), style));
+            match b.get("style").and_then(|x| x.as_str()).unwrap_or("normal") {
+                "primary" => {
+                    has_primary = true;
+                    if primary_idx.is_none() {
+                        primary_idx = Some(buttons.len());
+                    }
+                }
+                "danger" => has_danger = true,
+                _ => {}
+            }
+            buttons.push(take(label.trim(), 12));
         }
     }
     if buttons.is_empty() {
-        buttons.push(("好".into(), "primary".into()));
+        buttons.push("好".into());
+        has_primary = true;
     }
-    let timeout = v
-        .get("timeout_secs")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(120)
-        .clamp(10, 600);
-    let payload = json!({
-        "title": title,
-        "body": body,
-        "buttons": buttons
-            .iter()
-            .map(|(l, s)| json!({"label": l, "style": s}))
-            .collect::<Vec<_>>(),
-    });
-    Ok((payload.to_string(), timeout))
+    Ok(DialogParams {
+        title,
+        body,
+        default_idx: primary_idx.unwrap_or(0),
+        warn_icon: has_danger,
+        info_icon: !has_danger && has_primary,
+        buttons,
+        timeout_secs: v
+            .get("timeout_secs")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(120)
+            .clamp(10, 600),
+    })
 }
 
-fn dialog_height_estimate(body: &str) -> f64 {
-    // 内容宽约 332px，中文 13.5px → ~23 字/行；行数超出内部滚动
-    let lines = (body.chars().count() as f64 / 23.0).ceil().clamp(1.0, 14.0);
-    (170.0 + lines * 20.0).clamp(200.0, 560.0)
+#[cfg(windows)]
+mod task_dialog {
+    use windows::core::{HSTRING, PCWSTR, HRESULT};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::UI::Controls::{
+        TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOG_NOTIFICATIONS,
+        TD_INFORMATION_ICON, TD_WARNING_ICON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_CALLBACK_TIMER, TDF_POSITION_RELATIVE_TO_WINDOW, TDN_TIMER,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    /// TDM_CLOSE = WM_USER + 102（wParam=0 → TaskDialogIndirect 返回 0，与用户 Esc 的 IDCANCEL 区分开）
+    const TDM_CLOSE: u32 = 0x0400 + 102;
+
+    type TaskDialogIndirectFn = unsafe extern "system" fn(
+        pctd: *const TASKDIALOGCONFIG,
+        pnbutton: *mut i32,
+        pnradiobutton: *mut i32,
+        pfverificationflagchecked: *mut windows::core::BOOL,
+    ) -> HRESULT;
+
+    /// TDF_CALLBACK_TIMER 下 TDN_TIMER 的 lParam = 已流逝毫秒；到点发 TDM_CLOSE(0)
+    unsafe extern "system" fn dialog_cb(
+        hwnd: HWND,
+        msg: TASKDIALOG_NOTIFICATIONS,
+        _w: WPARAM,
+        lparam: LPARAM,
+        timeout_ms: isize,
+    ) -> HRESULT {
+        if msg == TDN_TIMER && lparam.0 >= timeout_ms {
+            let _ = SendMessageW(hwnd, TDM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        HRESULT(0)
+    }
+
+    /// 动态解析 comctl32 v6 的 TaskDialogIndirect（零静态 import：lib 测试 exe 的
+    /// comctl32 静态导入在受限环境 loader 会 0xC0000139，动态加载彻底绕开）
+    fn resolve_task_dialog() -> Result<TaskDialogIndirectFn, String> {
+        unsafe {
+            let lib = LoadLibraryW(windows::core::w!("comctl32.dll"))
+                .map_err(|e| format!("加载 comctl32 失败: {e}"))?;
+            let proc = GetProcAddress(lib, windows::core::s!("TaskDialogIndirect"))
+                .ok_or("系统缺 comctl32 v6（TaskDialog 不可用）")?;
+            Ok(std::mem::transmute::<_, TaskDialogIndirectFn>(proc))
+        }
+    }
+
+    /// 阻塞显示原生弹窗，返回 TaskDialogIndirect 的原始按钮 id：
+    /// >=1001 = 自定义按钮（1001+下标）；2(IDCANCEL) = 用户 Esc/系统关闭；0 = 超时
+    pub unsafe fn show(
+        parent: isize,
+        title: &str,
+        body: &str,
+        buttons: &[String],
+        default_idx: usize,
+        warn_icon: bool,
+        info_icon: bool,
+        timeout_ms: u64,
+    ) -> Result<i32, String> {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let task_dialog_indirect = resolve_task_dialog()?;
+
+        let wtitle = HSTRING::from("VCC");
+        let wmain = HSTRING::from(title);
+        let wbody = HSTRING::from(body);
+        let wlabels: Vec<HSTRING> = buttons.iter().map(|s| HSTRING::from(s.as_str())).collect();
+        let tdbuttons: Vec<TASKDIALOG_BUTTON> = wlabels
+            .iter()
+            .enumerate()
+            .map(|(i, h)| TASKDIALOG_BUTTON {
+                nButtonID: 1001 + i as i32,
+                pszButtonText: PCWSTR::from_raw(h.as_ptr()),
+            })
+            .collect();
+
+        let icon = if warn_icon {
+            TD_WARNING_ICON
+        } else if info_icon {
+            TD_INFORMATION_ICON
+        } else {
+            PCWSTR::null()
+        };
+
+        let cfg = TASKDIALOGCONFIG {
+            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            hwndParent: HWND(parent as *mut core::ffi::c_void),
+            dwFlags: TDF_ALLOW_DIALOG_CANCELLATION
+                | TDF_CALLBACK_TIMER
+                | TDF_POSITION_RELATIVE_TO_WINDOW,
+            pszWindowTitle: PCWSTR::from_raw(wtitle.as_ptr()),
+            Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },
+            pszMainInstruction: PCWSTR::from_raw(wmain.as_ptr()),
+            pszContent: PCWSTR::from_raw(wbody.as_ptr()),
+            cButtons: tdbuttons.len() as u32,
+            pButtons: tdbuttons.as_ptr(),
+            nDefaultButton: 1001 + default_idx as i32,
+            pfCallback: Some(dialog_cb),
+            lpCallbackData: timeout_ms as isize,
+            ..Default::default()
+        };
+
+        let mut clicked: i32 = 0;
+        let mut radio: i32 = 0;
+        let mut verified = windows::core::BOOL::default();
+        let hr = task_dialog_indirect(&cfg, &mut clicked, &mut radio, &mut verified);
+        if hr.is_err() {
+            return Err(format!("TaskDialog 失败: {hr}"));
+        }
+        Ok(clicked)
+    }
+}
+
+#[cfg(not(windows))]
+mod task_dialog {
+    pub unsafe fn show(
+        _parent: isize, _title: &str, _body: &str, _buttons: &[String],
+        _default_idx: usize, _warn: bool, _info: bool, _timeout_ms: u64,
+    ) -> Result<i32, String> {
+        Err("非 Windows 平台暂不支持弹窗".into())
+    }
 }
 
 async fn show_dialog(v: &Value) -> ToolResult {
-    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-    let app = crate::APP_HANDLE.get().ok_or("App 未初始化")?;
-    let (payload, timeout) = dialog_payload(v)?;
-    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-    let height = dialog_height_estimate(body);
+    use tauri::Manager;
+    let p = dialog_params(v)?;
+    // 父窗口：主窗可见时弹窗贴合其上（HWND 以 isize 跨线程传递）
+    let parent = crate::APP_HANDLE
+        .get()
+        .and_then(|app| app.get_webview_window("main"))
+        .filter(|w| w.is_visible().unwrap_or(false))
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize)
+        .unwrap_or(0);
 
-    // 上一个弹窗没关干净时先销毁（窗口 label 冲突）
-    if let Some(old) = app.get_webview_window("dialog") {
-        let _ = old.destroy();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    *DIALOG_RESULT_TX.lock().unwrap() = Some(tx);
-    *DIALOG_PAYLOAD.lock().unwrap() = Some(payload);
-
-    let win = WebviewWindowBuilder::new(app, "dialog", WebviewUrl::App("dialog.html".into()))
-        .title("VCC")
-        .inner_size(380.0, height)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .center()
-        .focused(true)
-        .build()
-        .map_err(|e| format!("弹窗创建失败: {e}"))?;
-
-    // Alt+F4 / 系统级关闭兜底（正常路径走 emit → tx）
-    win.on_window_event(move |e| {
-        if matches!(e, tauri::WindowEvent::Destroyed) {
-            // 发送后端可识别的关闭载荷；桥已清则 send 失败无妨
-            let _ = serde_json::to_string(&json!({"label": "__closed__"}))
-                .map(|p| {
-                    if let Some(tx) = DIALOG_RESULT_TX.lock().unwrap().as_ref() {
-                        let _ = tx.send(p);
-                    }
-                });
-        }
+    let (tx, rx) = std::sync::mpsc::channel::<Result<i32, String>>();
+    let (title, body, buttons) = (p.title.clone(), p.body.clone(), p.buttons.clone());
+    let (di, wi, ii, tms) = (p.default_idx, p.warn_icon, p.info_icon, p.timeout_secs * 1000);
+    std::thread::spawn(move || {
+        // 专用线程 + STA COM（任务对话框要求 COM 初始化；不占用 tokio 阻塞池线程）
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            task_dialog::show(parent, &title, &body, &buttons, di, wi, ii, tms)
+        }));
+        let _ = tx.send(r.unwrap_or_else(|_| Err("弹窗线程崩溃".into())));
     });
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), rx.recv()).await;
-    *DIALOG_RESULT_TX.lock().unwrap() = None;
-    *DIALOG_PAYLOAD.lock().unwrap() = None;
-    if let Some(w) = app.get_webview_window("dialog") {
-        let _ = w.destroy();
-    }
-
-    let label = match result {
-        Ok(Some(p)) => serde_json::from_str::<Value>(&p)
-            .ok()
-            .and_then(|x| x.get("label").and_then(|l| l.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| "__closed__".into()),
-        _ => "__timeout__".into(),
+    // 硬上限：正常路径由弹窗自身计时器先关（TDM_CLOSE），这里兜底防线程挂死
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(p.timeout_secs + 15),
+        tokio::task::spawn_blocking(move || rx.recv()),
+    )
+    .await;
+    let clicked = match outcome {
+        Ok(Ok(Ok(Ok(id)))) => id,
+        _ => 0, // 通道断/挂死 → 按超时处理
     };
-    match label.as_str() {
-        "__closed__" => Ok("用户按 Esc 关闭了弹窗（未选择）".into()),
-        "__timeout__" => Ok(format!("弹窗 {timeout} 秒内未得到响应，已自动关闭")),
-        l => Ok(format!("用户选择了「{l}」")),
-    }
+
+    Ok(match clicked {
+        id if id >= 1001 => format!(
+            "用户选择了「{}」",
+            p.buttons.get((id - 1001) as usize).cloned().unwrap_or_else(|| "?".into())
+        ),
+        2 => "用户按 Esc 关闭了弹窗（未选择）".into(),
+        0 => format!("弹窗 {} 秒内未得到响应，已自动关闭", p.timeout_secs),
+        _ => "弹窗已关闭（未选择）".into(),
+    })
 }
 
 /* ================= 剪贴板 ================= */

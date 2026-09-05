@@ -165,32 +165,31 @@ mod vcc_tests {
 
     /* ---------- 弹窗参数 ---------- */
 
-    /// 弹窗参数：缺省按钮补「好/primary」，超时 clamp
+    /// 弹窗参数：缺省按钮补「好」，默认焦点=第一个 primary，danger 触发警告图标，超时 clamp
     #[test]
-    fn dialog_payload_defaults() {
+    fn dialog_params_defaults() {
         let v: serde_json::Value = serde_json::json!({"body": "要继续吗？"});
-        let (payload, timeout) = dialog_payload(&v).expect("payload");
-        assert_eq!(timeout, 120);
-        let p: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(p["title"], "提示");
-        assert_eq!(p["buttons"][0]["label"], "好");
-        assert_eq!(p["buttons"][0]["style"], "primary");
+        let p = dialog_params(&v).expect("params");
+        assert_eq!(p.timeout_secs, 120);
+        assert_eq!(p.buttons, vec!["好"]);
+        assert_eq!(p.default_idx, 0);
+        assert!(p.info_icon && !p.warn_icon);
 
         let v2: serde_json::Value = serde_json::json!({
             "title": "确认", "body": "删除这个吗？", "timeout_secs": 5,
             "buttons": [{"label": "删除", "style": "danger"}, {"label": "取消", "style": "primary"}]
         });
-        let (payload2, timeout2) = dialog_payload(&v2).unwrap();
-        assert_eq!(timeout2, 10, "超时应 clamp 到 10s 下限");
-        let p2: serde_json::Value = serde_json::from_str(&payload2).unwrap();
-        assert_eq!(p2["buttons"][0]["style"], "danger");
-        assert_eq!(p2["buttons"][1]["label"], "取消");
+        let p2 = dialog_params(&v2).unwrap();
+        assert_eq!(p2.timeout_secs, 10, "超时应 clamp 到 10s 下限");
+        assert!(p2.warn_icon && !p2.info_icon, "danger 优先用警告图标");
+        assert_eq!(p2.default_idx, 1, "默认焦点=第一个 primary（取消）");
+        assert_eq!(p2.buttons, vec!["删除", "取消"]);
     }
 
     /// 弹窗正文为空必须报错（防止空弹窗骚扰用户）
     #[test]
-    fn dialog_payload_requires_body() {
+    fn dialog_params_requires_body() {
         let v: serde_json::Value = serde_json::json!({"title": "hi"});
-        assert!(dialog_payload(&v).is_err());
+        assert!(dialog_params(&v).is_err());
     }
 }

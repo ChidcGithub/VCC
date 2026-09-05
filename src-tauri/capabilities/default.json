@@ -5,8 +5,7 @@
     "main",
     "floating",
     "overlay",
-    "overlay-*",
-    "dialog"
+    "overlay-*"
   ],
   "permissions": [
     "core:default",
