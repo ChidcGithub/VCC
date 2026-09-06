@@ -192,4 +192,15 @@ mod vcc_tests {
         let v: serde_json::Value = serde_json::json!({"title": "hi"});
         assert!(dialog_params(&v).is_err());
     }
+
+    /* ---------- 开机自启（真实 HKCU 注册表读写） ---------- */
+
+    /// 写 → 删 → 再删：删除必须幂等（值不存在也 Ok）。
+    /// 回归：保存设置时勾未开自启，reg delete 报「找不到注册表项」致保存失败
+    #[test]
+    fn autostart_write_delete_idempotent() {
+        vcc_lib::set_autostart_impl(true).expect("写入自启动值");
+        vcc_lib::set_autostart_impl(false).expect("删除自启动值");
+        vcc_lib::set_autostart_impl(false).expect("重复删除应幂等（值不存在不算失败）");
+    }
 }

@@ -688,18 +688,46 @@ fn reg_run(args: &[&str]) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        // reg 的 stderr 是系统 ACP 编码（中文系统 GBK），按 UTF-8 展示必乱码；
+        // 不透传原始输出，给可读中文 + 退出码
+        Err(format!(
+            "注册表操作失败（reg {} 退出码 {:?}）",
+            args.first().copied().unwrap_or("?"),
+            out.status.code()
+        ))
     }
 }
 
-/// 开机自启：写/删 HKCU Run 键（免管理员；路径含空格以引号包裹）
+/// 自启动值是否存在（reg query 成功即存在）
+fn reg_run_exists() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("reg")
+        .args(["query", RUN_KEY, "/v", "VCC"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 开机自启：写/删 HKCU Run 键（免管理员；路径含空格以引号包裹）。
+/// 删除幂等：值本来就不存在 = 目标已达成（此前直接 delete，值不存在时
+/// reg 报「找不到注册表项」把整个保存流程带崩）。
+/// 逻辑放 *_impl 供测试直调——#[tauri::command] 的 pub fn 会双重导出
+/// __cmd__ 名称与 generate_handler 冲突（E0255），命令 fn 必须保持私有
 #[tauri::command]
 fn set_autostart(on: bool) -> Result<(), String> {
+    set_autostart_impl(on)
+}
+
+pub fn set_autostart_impl(on: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     if on {
         reg_run(&["add", RUN_KEY, "/v", "VCC", "/t", "REG_SZ",
                   "/d", &format!("\"{}\"", exe.display()), "/f"])
     } else {
+        if !reg_run_exists() {
+            return Ok(());
+        }
         reg_run(&["delete", RUN_KEY, "/v", "VCC", "/f"])
     }
 }

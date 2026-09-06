@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### 修复：保存设置报「保存失败：注册表乱码错误」
+
+- **根因**：设置里「开机自启」未勾选时保存，`reg delete` 在自启动值不存在的情况下返回非零（错误文案为 GBK 编码的「系统找不到指定的注册表项或值」，被按 UTF-8 展示成乱码），中断整个保存流程
+- **修复**：删除前先 `reg query` 探测存在性——值不存在即目标已达成（幂等）；`reg` 失败时不再透传原始 ACP/GBK 输出，改报可读中文 + 退出码
+- 新增回归测试 `autostart_write_delete_idempotent`（真实 HKCU 注册表：写 → 删 → 再删全 Ok）；测试直调入口为 `set_autostart_impl`（`#[tauri::command]` 的 pub fn 会与 generate_handler 双重导出冲突，命令 fn 须保持私有）
+
 ### M3 图标体系
 
 - **全量替换字符/手绘图标为 Material Symbols Rounded（M3 官方图标）**：工具行执行/完成/失败（progress_activity 旋转 / check / cancel）、会话更多（more_horiz）、重命名/删除菜单（edit / delete）、新对话（edit_square）、主题（light_mode/dark_mode 随主题联动）、设置（settings）、侧栏折叠/展开（left_panel_close / menu）、麦克风（mic）、发送（arrow_upward）、空态闪电 logo（bolt，FILL 填充）、设置关闭（close）、悬浮窗步骤图标与主窗同套
