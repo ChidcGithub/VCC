@@ -321,16 +321,29 @@ listen('vcc://chat', (e) => {
 });
 
 // 流式回答（打字机）
+// delta 用 rAF 批量上屏：SSE 块可能一秒几十个，逐块 textContent+= 会每次强制重排
+// + scrollHeight 读取，长回答时主线程被打满（界面卡顿的来源之一）
+let pendingDelta = '';
+let deltaRaf = 0;
 listen('vcc://chat-start', () => {
   streamBubble = addBubble('ai', '');
 });
 listen('vcc://chat-delta', (e) => {
   if (!streamBubble) streamBubble = addBubble('ai', '');
-  streamBubble.textContent += e.payload.text;
-  scrollChat(false);
+  pendingDelta += e.payload.text;
+  if (!deltaRaf) deltaRaf = requestAnimationFrame(() => {
+    deltaRaf = 0;
+    if (!streamBubble) { pendingDelta = ''; return; }
+    streamBubble.textContent += pendingDelta;
+    pendingDelta = '';
+    scrollChat(false);
+  });
 });
 listen('vcc://chat-end', () => {
   if (streamBubble) {
+    if (deltaRaf) { cancelAnimationFrame(deltaRaf); deltaRaf = 0; }
+    streamBubble.textContent += pendingDelta; // 先冲掉未上屏的尾巴再渲染 markdown
+    pendingDelta = '';
     streamBubble.innerHTML = renderInlineMd(streamBubble.textContent);
     speak(streamBubble.textContent);
   }

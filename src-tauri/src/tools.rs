@@ -219,7 +219,14 @@ pub async fn screenshot() -> ToolResult {
     let path = std::env::temp_dir().join(format!("vcc-screenshot-{ts}.png"));
     let p = path.display().to_string().replace("'", "''");
     let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;          $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen;          $b=New-Object System.Drawing.Bitmap $vs.Width, $vs.Height;          $g=[System.Drawing.Graphics]::FromImage($b);          $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $b.Size);          $g.Dispose(); $b.Save('{p}'); $b.Dispose(); Write-Output 'ok'",
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;          \
+         Add-Type -Namespace W -Name Dpi -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();';          \
+         [void][W.Dpi]::SetProcessDPIAware();          \
+         $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen;          \
+         $b=New-Object System.Drawing.Bitmap $vs.Width, $vs.Height;          \
+         $g=[System.Drawing.Graphics]::FromImage($b);          \
+         $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $b.Size);          \
+         $g.Dispose(); $b.Save('{p}'); $b.Dispose(); Write-Output 'ok'",
         p = p
     );
     powershell_raw(&script).await?;
@@ -393,7 +400,20 @@ fn window_rect_by_title(kw: &str) -> Result<(i32, i32, i32, i32), String> {
 
 /// OCR 脚本（PowerShell 运行时调 WinRT。不用 windows crate 的 WinRT 绑定：
 /// 它会静态链接 api-ms-win-core-winrt-*, 部分环境 loader 解析不了导致进程 0xC0000139）
-static OCR_PS1: &[u8] = include_bytes!("../../scripts/ocr-screen.ps1");
+///
+/// !!! 此 ps1 必须保持纯 ASCII（注释只能写英文）!!!
+/// PS5.1 对无 BOM 文件按 GBK 解码：行尾中文字若是 GBK 前导字节会吞掉 LF，
+/// 把下一行并进注释——Add-Type 定义曾因此整行消失，OCR 秒挂（TypeNotFound）
+pub const OCR_PS1: &[u8] = include_bytes!("../../scripts/ocr-screen.ps1");
+
+// 编译期守卫：ps1 混入任何非 ASCII 字节直接构建失败
+const _: () = {
+    let mut i = 0;
+    while i < OCR_PS1.len() {
+        assert!(OCR_PS1[i] < 0x80, "ocr-screen.ps1 must stay pure ASCII");
+        i += 1;
+    }
+};
 
 async fn powershell_file(script_path: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("powershell");

@@ -203,4 +203,33 @@ mod vcc_tests {
         vcc_lib::set_autostart_impl(false).expect("删除自启动值");
         vcc_lib::set_autostart_impl(false).expect("重复删除应幂等（值不存在不算失败）");
     }
+
+    /* ---------- OCR 落盘脚本 E2E（真实 spawn powershell） ---------- */
+
+    /// 与 ocr_screen 同参跑一遍嵌入脚本：捕获 stderr 定位快速失败。
+    /// 无语言包时脚本输出 __NO_OCR__（exit 2）也算通过（功能路径正常，环境缺语言包）。
+    #[test]
+    fn ocr_ps1_e2e() {
+        let ps1 = std::env::temp_dir().join("vcc-ocr-e2e.ps1");
+        std::fs::write(&ps1, OCR_PS1).expect("写脚本失败");
+        println!("ps1 = {}", ps1.display());
+        println!("first bytes: {:02x?}", &OCR_PS1[..16.min(OCR_PS1.len())]);
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", &ps1.display().to_string(),
+                "-X", "0", "-Y", "0", "-W", "800", "-H", "600",
+            ])
+            .output()
+            .expect("启动 powershell 失败");
+        let so = String::from_utf8_lossy(&out.stdout);
+        let se = String::from_utf8_lossy(&out.stderr);
+        println!("status = {:?}", out.status);
+        println!("stdout = {so}");
+        println!("stderr = {se}");
+        assert!(
+            out.status.success() || so.contains("__NO_OCR__"),
+            "OCR 脚本失败（stderr 见上）"
+        );
+    }
 }

@@ -22,9 +22,12 @@ uniform vec2 uRes;
 uniform float uTime;
 uniform float uInt;
 uniform float uLevel;
-uniform float uSpin;
+uniform float uSpinAng;
 
 float hash(vec2 p) {
+  /* 坐标先折回 289 周期：tAcc 长期累积后 fbm 坐标可达数千，
+     不折回则大数 fract 精度坍缩 → 噪声退化成高频闪烁 */
+  p = p - floor(p * (1.0 / 289.0)) * 289.0;
   p = fract(p * vec2(123.34, 456.21));
   p += dot(p, p + 45.32);
   return fract(p.x * p.y);
@@ -101,8 +104,10 @@ void main() {
   vec2 dir = q / max(length(q), 1e-4);
 
   /* 定向环流：长涌噪声场绕屏幕旋转（Siri thinking 的能量流动感）
-     刚体旋转保持单位圆周期性 → 天然无缝 */
-  float ra = t * uSpin;
+     刚体旋转保持单位圆周期性 → 天然无缝。
+     角度由 JS 按 dt×curR 积分传入（uSpinAng）——旧实现 ra=t*uSpin 会在
+     相变时产生 tAcc×ΔcurR 的角速度尖峰，tAcc 随对话累积 → 跑马灯越用越快 */
+  float ra = uSpinAng;
   mat2 R = mat2(cos(ra), -sin(ra), sin(ra), cos(ra));
   vec2 rdir = R * dir;
 
@@ -123,14 +128,14 @@ void main() {
   float ca = 0.05 * sin(t * 0.7 + dir.x * 12.0 + dir.y * 7.0);
   /* 核心光带：外半边厚而浓（铺满到屏幕物理边缘），内半边延展渐淡 */
   float coreC = -width * (0.50 + 0.80 * wave);
-  float br = gaussAsym(d, coreC + ca * width, width * 0.42, width * 1.45);
-  float bg = gaussAsym(d, coreC, width * 0.42, width * 1.45);
-  float bb = gaussAsym(d, coreC - ca * width, width * 0.42, width * 1.45);
+  float br = gaussAsym(d, coreC + ca * width, width * 0.60, width * 1.45);
+  float bg = gaussAsym(d, coreC, width * 0.60, width * 1.45);
+  float bb = gaussAsym(d, coreC - ca * width, width * 0.60, width * 1.45);
   float core = (br + bg + bb) / 3.0;
 
   /* 柔光晕：重心贴边，外半边大范围铺开，内半边深延展渐淡 */
   float bloomC = -width * (0.85 + 0.60 * waveB);
-  float bloom = gaussAsym(d, bloomC, width * 1.55, width * 2.60);
+  float bloom = gaussAsym(d, bloomC, width * 2.10, width * 2.60);
 
   /* 亮脊线：光在液体边缘波峰上集中（贴核心内缘的镜面高光） */
   float cx = (d - coreC + width * 0.60) / (width * 0.15);
@@ -209,7 +214,7 @@ const uRes = gl.getUniformLocation(prog, 'uRes');
 const uTime = gl.getUniformLocation(prog, 'uTime');
 const uInt = gl.getUniformLocation(prog, 'uInt');
 const uLevel = gl.getUniformLocation(prog, 'uLevel');
-const uSpin = gl.getUniformLocation(prog, 'uSpin');
+const uSpinAng = gl.getUniformLocation(prog, 'uSpinAng');
 
 gl.enable(gl.BLEND);
 gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -246,7 +251,7 @@ const TARGETS = {
 const RING_ON = new Set(['listening', 'executing', 'done']);
 let tgtI = 0, tgtS = 0.5, tgtR = 0.015, curI = 0, curS = 0.5, curR = 0.015;
 let lvlTarget = 0, lvl = 0;
-let tAcc = 0, last = performance.now();
+let tAcc = 0, raAcc = 0, last = performance.now();
 
 function setPhase(p) {
   if (!TARGETS[p]) return;
@@ -268,12 +273,16 @@ function frame(now) {
   const lk = lvlTarget > lvl ? 1 - Math.exp(-dt * 22) : 1 - Math.exp(-dt * 4.5);
   lvl += (lvlTarget - lvl) * lk;
   tAcc += dt * Math.max(curS, 0.05);
+  /* 环流角度 JS 积分：角速度=curR 平滑变化，与 tAcc 解耦。
+     2π 回绕无缝（刚体旋转的周期性），顺带防角度本身精度退化 */
+  raAcc += dt * curR;
+  if (raAcc > 6.2831853) raAcc -= 6.2831853;
   resize();
   gl.uniform2f(uRes, canvas.width, canvas.height);
   gl.uniform1f(uTime, tAcc);
   gl.uniform1f(uInt, curI);
   gl.uniform1f(uLevel, lvl);
-  gl.uniform1f(uSpin, curR);
+  gl.uniform1f(uSpinAng, raAcc);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.drawArrays(gl.TRIANGLES, 0, 3);

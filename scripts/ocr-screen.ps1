@@ -1,5 +1,17 @@
 param([int]$X, [int]$Y, [int]$W, [int]$H)
 $ErrorActionPreference = 'Stop'
+# KEEP THIS FILE PURE ASCII (no Chinese comments!).
+# PS5.1 reads BOM-less files as GBK: a Chinese char at end-of-line can be a GBK
+# lead byte that swallows the following LF, merging the next line into the
+# comment (the Add-Type below silently vanished this way once).
+# Make the whole process DPI aware: powershell.exe is DPI-unaware by default,
+# so on scaled displays (125%/150%) CopyFromScreen coords get virtualized.
+# X/Y/W/H come from the PMv2-aware host and are physical pixels.
+Add-Type -Namespace Native -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[void][Native.Dpi]::SetProcessDPIAware()
+# Redirected stdout defaults to OEM codepage (GBK): Chinese OCR text would be
+# garbled by the host's from_utf8_lossy. Force UTF-8 on the output pipes.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
@@ -10,7 +22,12 @@ $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-O
 function Await($Op, [Type]$ResultType) {
     $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
     $netTask = $asTask.Invoke($null, @($Op))
-    $netTask.Wait(-1) | Out-Null
+    try {
+        $netTask.Wait(-1) | Out-Null
+    } catch {
+        # Unwrap AggregateException so the real WinRT error reaches stderr
+        throw $_.Exception.InnerException
+    }
     $netTask.Result
 }
 
@@ -25,7 +42,9 @@ $b = New-Object System.Drawing.Bitmap $W, $H
 $g = [System.Drawing.Graphics]::FromImage($b)
 $g.CopyFromScreen($X, $Y, 0, 0, (New-Object System.Drawing.Size($W, $H)))
 $g.Dispose()
-$tmp = Join-Path $env:TEMP 'vcc-ocr-capture.png'
+# PID-unique capture path: concurrent runs (tests or rapid tool calls) must not
+# clobber each other's PNG (one process' finally-delete would break the other)
+$tmp = Join-Path $env:TEMP ("vcc-ocr-capture-{0}.png" -f $PID)
 $b.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
 $b.Dispose()
 

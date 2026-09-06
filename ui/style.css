@@ -59,10 +59,11 @@ body {
   font-family: system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
     "PingFang SC", "Microsoft YaHei UI", sans-serif;
   font-size: 15px;
-  background: var(--bg);
+  background: transparent;  /* 圆角窗口：底色和圆角由 .app 画，body 留 10px 透明边给阴影 */
+  padding: 10px;
   color: var(--text-1);
   -webkit-font-smoothing: antialiased;
-  transition: background 0.25s ease, color 0.25s ease;
+  transition: color 0.25s ease;
 }
 
 button {
@@ -81,10 +82,16 @@ button {
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* ---------- 总布局 ---------- */
+/* 圆角窗口：透明窗口里由 .app 画底色/圆角/边框/投影（overflow:hidden 裁剪内容） */
 .app {
   display: flex;
   height: 100%;
   overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  transition: background 0.25s ease;
 }
 
 /* ---------- 侧边栏（261px，对齐官方 --sider-width） ---------- */
