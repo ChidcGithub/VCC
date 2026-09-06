@@ -232,15 +232,18 @@ resize();
 
 /* phase → [强度, 速度, 环流]；JS 端弹性插值，速度/环流变化不跳变
    done = 完成绽放（回答收尾时短暂爆亮再回落）
-   环流 spin：波场绕屏幕定向旋转，thinking/executing 明显加速 */
+   跑马灯显示集（Rust 侧同步）：listening / executing；
+   summoned/thinking/idle 强度 0 —— thinking 期间光带平滑淡出，950ms 后窗口隐藏 */
 const TARGETS = {
   idle:      [0.00, 0.50, 0.015],
-  invoke:    [0.50, 0.55, 0.05],
+  summoned:  [0.00, 0.50, 0.015],
   listening: [0.76, 0.85, 0.07],
-  thinking:  [0.85, 1.05, 0.42],
+  thinking:  [0.00, 0.50, 0.015],
   executing: [1.00, 2.30, 1.10],
   done:      [1.22, 1.40, 0.30],
 };
+/* .on（可见性过渡）仅对显示集开启；done 是 executing 的收尾绽放，随延迟隐藏自然淡出 */
+const RING_ON = new Set(['listening', 'executing', 'done']);
 let tgtI = 0, tgtS = 0.5, tgtR = 0.015, curI = 0, curS = 0.5, curR = 0.015;
 let lvlTarget = 0, lvl = 0;
 let tAcc = 0, last = performance.now();
@@ -251,7 +254,7 @@ function setPhase(p) {
   tgtI = i;
   tgtS = s;
   tgtR = r;
-  canvas.classList.toggle('on', p !== 'idle');
+  canvas.classList.toggle('on', RING_ON.has(p));
 }
 
 function frame(now) {

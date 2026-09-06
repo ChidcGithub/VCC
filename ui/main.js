@@ -21,31 +21,39 @@ const sendBtn = document.getElementById('btn-send');
 
 const PHASE_TEXT = {
   idle: '',
-  listening: '聆听中…',
+  summoned: '聆听中…',   // 呼出待命（窗口已开、麦克风未开）
+  listening: '聆听中…',  // 麦克风真录音中
   thinking: '思考中…',
   executing: '执行中…',
   done: '',
 };
 
+/* 跑马灯显示集：仅真录音 + 工具执行（summoned/thinking/done 不全屏亮灯） */
+
 const emit = TAURI ? TAURI.event.emit : (async () => {});
 let currentPhase = '';
+let doneTimer = null;
 
 function setPhase(p) {
   if (currentPhase === p) return;
   currentPhase = p;
-  document.body.classList.remove('idle', 'listening', 'thinking', 'executing', 'done');
+  document.body.classList.remove('idle', 'summoned', 'listening', 'thinking', 'executing', 'done');
   document.body.classList.add(p);
   phaseEl.textContent = PHASE_TEXT[p] || '';
   phaseEl.classList.toggle('empty', p === 'idle');
+  // done 绽放统一在此回落（Rust 端也发 done，回落逻辑只写一处）
+  clearTimeout(doneTimer);
+  if (p === 'done') {
+    doneTimer = setTimeout(() => { if (currentPhase === 'done') setPhase('idle'); }, 900);
+  }
   // 广播给全屏 overlay 跑马灯（Rust 端也监听此事件负责窗口显示/隐藏）
   if (TAURI) emit('vcc://phase', { phase: p });
 }
 
-/* 完成绽放：回答收尾时光环短暂爆亮（done），~900ms 后回落 idle */
+/* 完成绽放：回答收尾时光环短暂爆亮（done），900ms 后由 setPhase 统一回 idle */
 function finishGlow() {
   if (['listening', 'thinking', 'executing'].includes(currentPhase)) {
     setPhase('done');
-    setTimeout(() => { if (currentPhase === 'done') setPhase('idle'); }, 900);
   }
 }
 
@@ -317,7 +325,8 @@ listen('vcc://tool-done', (e) => {
 });
 
 listen('vcc://invoked', () => {
-  setPhase('listening');
+  // Agent 执行中呼出不覆盖 phase（thinking/executing 是真实进行中的状态）
+  if (!agentBusy) setPhase('summoned');
   inputEl.focus();
   // 呼出入场：卡片 Apple 式弹入（一次性动画，重触发用 reflow 重启）
   document.body.classList.remove('summon');
@@ -373,6 +382,7 @@ function ding(freq = 880, dur = 0.09, gain = 0.045) {
 }
 
 async function startRecording() {
+  if (recorder) return; // 防双击/重复 pointerdown 泄漏麦克风流
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -390,6 +400,10 @@ async function startRecording() {
 
     recorder = { ctx, stream, proc, src, chunks, startedAt: Date.now() };
     document.body.classList.add('recording');
+    // 记录录音前状态（summoned/idle/thinking…），松手后未被 send 接管时恢复它
+    recorder.prevPhase = currentPhase === 'listening' ? 'idle' : currentPhase;
+    // 真录音 → listening：跑马灯此刻才亮（呼出窗口 ≠ 开麦）
+    setPhase('listening');
     // 60s 上限：超长录音会拖垮低配设备的识别推理，到时自动停止
     recorder.maxTimer = setTimeout(() => { if (recorder) stopRecording(); }, 60000);
 
@@ -436,12 +450,16 @@ async function stopRecording() {
   r.stream.getTracks().forEach((t) => t.stop());
   r.ctx.close();
 
+  // 未被 send() 接管时的回落态：回到录音前状态（误触/没听清时「聆听中」提示保留）
+  const backPhase = (!r.prevPhase || r.prevPhase === 'listening' || r.prevPhase === 'done')
+    ? 'idle' : r.prevPhase;
+
   const durMs = Date.now() - r.startedAt;
-  if (durMs < 400) return; // 太短，误触
+  if (durMs < 400) { setPhase(backPhase); return; } // 太短，误触
 
   // 合并 + 16k 重采样 + Int16
   const total = r.chunks.reduce((n, c) => n + c.length, 0);
-  if (total === 0) return;
+  if (total === 0) { setPhase(backPhase); return; }
   const merged = new Float32Array(total);
   let off = 0;
   for (const c of r.chunks) { merged.set(c, off); off += c.length; }
@@ -460,13 +478,13 @@ async function stopRecording() {
     } else {
       // 纯噪音/太轻：明确提示而非无声消失
       showTranscript('没听清，请靠近一点再试');
-      setPhase('idle');
+      setPhase(backPhase);
       clearTimeout(transcriptTimer);
       transcriptTimer = setTimeout(hideTranscript, 2200);
     }
   } catch (e) {
     hideTranscript();
-    setPhase('idle');
+    setPhase(backPhase);
     // 识别失败重试需要用户再按一次麦克风，误导性的「重试」按钮不如直接引导
     addErrorBubble('语音识别失败：' + e + '（请按住麦克风再说一次）', { noRetry: true });
   }

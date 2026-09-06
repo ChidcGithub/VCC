@@ -475,7 +475,8 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
             let _ = app.emit("vcc://chat", json!({"role": "ai", "text": "✓ 已执行完成"}));
         }
         let _ = app.emit("vcc://float", json!({"mode": "done", "steps": steps, "text": answer}));
-        let _ = app.emit("vcc://phase", json!({"phase": "idle"}));
+        // done（而非直接 idle）：主窗完成绽放 + 跑马灯淡出；900ms 后由前端统一回落 idle
+        let _ = app.emit("vcc://phase", json!({"phase": "done"}));
         return Ok(());
     }
 }

@@ -135,7 +135,11 @@ pub fn run() {
                     }
                     let _ = h.emit("vcc://invoked", ());
                     std::thread::sleep(std::time::Duration::from_millis(700));
+                    // 模拟按住麦克风：跑马灯亮起（listening = 真录音态）
+                    let _ = h.emit("vcc://phase", serde_json::json!({"phase": "listening"}));
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                     // 悬浮窗演示：直接发 render 事件（真实链路与 agent 执行时一致）
+                    let _ = h.emit("vcc://phase", serde_json::json!({"phase": "executing"}));
                     let _ = h.emit("vcc://float", serde_json::json!({
                         "mode": "show",
                         "steps": [
@@ -342,8 +346,13 @@ fn setup_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     }
     }
 
-    // phase 事件 → overlay 显示/隐藏（idle 延迟隐藏，给淡出动画留时间）；覆盖所有显示器
+    // phase 事件 → overlay 显示/隐藏。显示集 = { listening(真录音), executing(工具执行) }，
+    // 其余（idle/summoned/thinking/done）延迟 950ms 隐藏——给淡出动画留时间，也给
+    // 「录音→思考→执行」的短暂 thinking 留缓冲，避免跑马灯闪烁。
+    // 代际计数器：每次新 phase 事件都使未决的延迟 hide 失效，
+    // 修复「idle 排了 hide → 950ms 内又开始录音 → hide 照样执行把跑马灯误杀」的竞态。
     let h = app.clone();
+    let hide_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     app.listen("vcc://phase", move |ev| {
         let phase = serde_json::from_str::<serde_json::Value>(ev.payload())
             .ok()
@@ -352,21 +361,28 @@ fn setup_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         if phase.is_empty() {
             return;
         }
+        let active = phase == "listening" || phase == "executing";
+        let gen = hide_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         for (label, w) in h.webview_windows() {
             if !label.starts_with("overlay") {
                 continue;
             }
-            if phase == "idle" {
+            if active {
+                let _ = w.show();
+            } else {
                 let h2 = h.clone();
                 let label2 = label.clone();
+                let gen2 = gen;
+                let pending = hide_gen.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(950)).await;
-                    if let Some(o) = h2.get_webview_window(&label2) {
-                        let _ = o.hide();
+                    // 期间若来了任何新 phase 事件（代数已变），放弃本次隐藏
+                    if pending.load(std::sync::atomic::Ordering::SeqCst) == gen2 {
+                        if let Some(o) = h2.get_webview_window(&label2) {
+                            let _ = o.hide();
+                        }
                     }
                 });
-            } else {
-                let _ = w.show();
             }
         }
     });
