@@ -30,6 +30,9 @@ pub struct Config {
     /// 朗读 AI 回答（投影课堂：学生听得到回答）
     #[serde(default)]
     pub tts_enabled: bool,
+    /// 界面主题：dark / light（body class 切换，对齐 chat.deepseek.com 机制）
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 fn default_base_url() -> String {
@@ -47,6 +50,9 @@ fn default_voice_model() -> String {
 fn default_voice_lang() -> String {
     "zh".into()
 }
+fn default_theme() -> String {
+    "dark".into() // VCC 暗色基因；设置面板可切浅色
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -62,6 +68,7 @@ impl Default for Config {
             voice_lang: default_voice_lang(),
             custom_cmds: Vec::new(),
             tts_enabled: false,
+            theme: default_theme(),
         }
     }
 }

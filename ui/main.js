@@ -1,4 +1,4 @@
-/* ============ VCC 主窗口逻辑 ============ */
+/* ============ VCC 主窗口逻辑（DeepSeek 式布局） ============ */
 /* 全局错误兜底：任何未捕获异常进对话流（err 气泡），不静默白屏 */
 window.addEventListener('error', (e) => {
   try {
@@ -13,11 +13,14 @@ const invoke = TAURI ? TAURI.core.invoke : (async () => ({}));
 const listen = TAURI ? TAURI.event.listen : (async () => {});
 
 const chatEl = document.getElementById('chat');
+const chatScrollEl = document.getElementById('chat-scroll');
 const inputEl = document.getElementById('input');
 const phaseEl = document.getElementById('phase-line');
 const transcriptEl = document.getElementById('live-transcript');
 const micBtn = document.getElementById('btn-mic');
 const sendBtn = document.getElementById('btn-send');
+const sessionListEl = document.getElementById('session-list');
+const topbarTitleEl = document.getElementById('topbar-title');
 
 const PHASE_TEXT = {
   idle: '',
@@ -27,8 +30,6 @@ const PHASE_TEXT = {
   executing: '执行中…',
   done: '',
 };
-
-/* 跑马灯显示集：仅真录音 + 工具执行（summoned/thinking/done 不全屏亮灯） */
 
 const emit = TAURI ? TAURI.event.emit : (async () => {});
 let currentPhase = '';
@@ -60,8 +61,9 @@ function finishGlow() {
 /* ---------- 对话渲染 ---------- */
 /* 智能滚动：仅当本来就贴近底部时跟随新消息（回看历史不被强拉走） */
 function scrollChat(force) {
-  const nearBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 90;
-  if (force || nearBottom) chatEl.scrollTop = chatEl.scrollHeight;
+  const el = chatScrollEl || chatEl;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+  if (force || nearBottom) el.scrollTop = el.scrollHeight;
 }
 
 function nowHM() {
@@ -131,9 +133,11 @@ function addErrorBubble(msg, opts = {}) {
   scrollChat(true); // 错误必须被看见
 }
 
+/* 空态模板：常驻引用（remove 只摘下 DOM，节点可反复复用） */
+const esTemplate = document.getElementById('empty-state');
+
 function hideEmptyState() {
-  const es = document.getElementById('empty-state');
-  if (es) es.remove();
+  if (esTemplate && esTemplate.isConnected) esTemplate.remove();
 }
 
 /* ---------- TTS 朗读（WebView2 原生 speechSynthesis，零依赖） ---------- */
@@ -194,16 +198,25 @@ let histDraft = '';
 
 function histNav(dir) { // -1 = 更早(↑)，+1 = 更新(↓)
   if (!inputHist.length) return;
+  if (inputEl.value.includes('\n')) return; // 多行编辑时不劫持方向键
   if (histPos === -1) {
     if (dir === 1) return;
     histDraft = inputEl.value;
     histPos = inputHist.length - 1;
   } else {
     histPos += dir;
-    if (histPos >= inputHist.length) { histPos = -1; inputEl.value = histDraft; return; }
+    if (histPos >= inputHist.length) { histPos = -1; inputEl.value = histDraft; autoGrow(); return; }
     if (histPos < 0) histPos = 0;
   }
   inputEl.value = inputHist[histPos];
+  autoGrow();
+}
+
+/* 发送完成后刷新会话列表（标题/排序更新），防抖 */
+let sessionRefreshTimer = null;
+function scheduleSessionRefresh() {
+  clearTimeout(sessionRefreshTimer);
+  sessionRefreshTimer = setTimeout(() => refreshSessions(), 900);
 }
 
 async function send(text) {
@@ -226,6 +239,7 @@ async function send(text) {
   stopSpeak();
   hideEmptyState();
   inputEl.value = '';
+  autoGrow();
   // 输入历史（↑/↓ 翻阅；相邻去重）
   if (text !== inputHist[inputHist.length - 1]) inputHist.push(text);
   if (inputHist.length > 50) inputHist.shift();
@@ -251,23 +265,36 @@ async function send(text) {
     sendBtn.disabled = false;
     // 兜底：流结束事件未触发绽放时（如纯工具轮次），在这里收尾
     finishGlow();
+    scheduleSessionRefresh(); // 会话标题/排序更新
   }
 }
 
 sendBtn.addEventListener('click', () => send(inputEl.value));
+
+/* 胶囊输入条：Enter 发送 / Shift+Enter 换行 / 自适应增高 */
+function autoGrow() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
+}
+inputEl.addEventListener('input', autoGrow);
 inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.isComposing) send(inputEl.value);
-  else if (e.key === 'ArrowUp' && !e.isComposing) { histNav(-1); e.preventDefault(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    send(inputEl.value);
+  } else if (e.key === 'ArrowUp' && !e.isComposing) { histNav(-1); e.preventDefault(); }
   else if (e.key === 'ArrowDown' && !e.isComposing) { histNav(1); e.preventDefault(); }
 });
 
 /* ESC 快速收起主窗（课堂场景一键隐藏；热键或托盘可再呼出）。
-   设置面板打开时先关面板。 */
+   优先级：会话菜单 > 设置面板 > 隐藏窗口 */
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
-    const s = document.getElementById('settings');
-    if (s && !s.classList.contains('hidden')) s.classList.add('hidden');
-    else invoke('hide_main');
+    if (!sessionMenuEl.classList.contains('hidden')) hideSessionMenu();
+    else {
+      const s = document.getElementById('settings');
+      if (s && !s.classList.contains('hidden')) s.classList.add('hidden');
+      else invoke('hide_main');
+    }
   } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'n' || e.key === 'N')) {
     // Ctrl+N：新对话（键盘流，手不离键盘）
     e.preventDefault();
@@ -433,7 +460,7 @@ async function startRecording() {
     };
     pump();
   } catch (e) {
-    addBubble('err', '无法访问麦克风：' + e);
+    addErrorBubble('无法访问麦克风：' + e, { noRetry: true });
   }
 }
 
@@ -548,7 +575,7 @@ function encodeWavBase64(f32, sampleRate) {
   wstr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
   view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true); wstr(36, 'data'); view.setUint32(40, n * 2, true);
+  view.setUint32(34, 16, true); wstr(36, 'data'); view.setUint32(40, n * 2, true);
   for (let i = 0; i < n; i++) {
     const s = Math.max(-1, Math.min(1, f32[i]));
     view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
@@ -562,31 +589,278 @@ function encodeWavBase64(f32, sampleRate) {
   return btoa(bin);
 }
 
-/* ---------- 头部按钮 ---------- */
+/* ============================================================
+   多会话（对标 chat.deepseek.com 侧栏）
+   ============================================================ */
+let sessionList = [];      // [{id,title,updated_at}] 按更新时间倒序
+let currentSid = '';       // 当前会话 id
+let renamingId = null;     // 正在重命名的会话
+
+const sessionMenuEl = document.getElementById('session-menu');
+
+/* 时间戳解析：Rust 端格式 "2026年9月6日 14:33" */
+function parseCnTime(s) {
+  const m = /(\d+)年(\d+)月(\d+)日\s+(\d+):(\d+)/.exec(s || '');
+  if (!m) return new Date(0);
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+}
+
+function timeGroup(updatedAt) {
+  const d = parseCnTime(updatedAt);
+  const now = new Date();
+  const day0 = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.floor((day0(now) - day0(d)) / 86400000);
+  if (diff <= 0) return '今天';
+  if (diff === 1) return '昨天';
+  if (diff <= 7) return '7 天内';
+  if (diff <= 30) return '30 天内';
+  return '更早';
+}
+
+async function refreshSessions() {
+  try {
+    const payload = await invoke('list_sessions');
+    sessionList = payload.list || [];
+    if (payload.current) currentSid = payload.current;
+    renderSessions();
+  } catch (_) { /* 列表失败不阻塞对话 */ }
+}
+
+function renderSessions() {
+  sessionListEl.innerHTML = '';
+  if (!sessionList.length) {
+    const d = document.createElement('div');
+    d.className = 'sb-empty';
+    d.textContent = '还没有对话';
+    sessionListEl.appendChild(d);
+    return;
+  }
+  let lastGroup = '';
+  for (const s of sessionList) {
+    const g = timeGroup(s.updated_at);
+    if (g !== lastGroup) {
+      lastGroup = g;
+      const label = document.createElement('div');
+      label.className = 'group-label';
+      label.textContent = g;
+      sessionListEl.appendChild(label);
+    }
+    sessionListEl.appendChild(buildSessionItem(s));
+  }
+}
+
+function buildSessionItem(s) {
+  const item = document.createElement('div');
+  item.className = 'session-item' + (s.id === currentSid ? ' active' : '');
+  item.dataset.id = s.id;
+
+  const title = document.createElement('span');
+  title.className = 's-title';
+  title.textContent = s.title || '新对话';
+  item.appendChild(title);
+
+  const more = document.createElement('button');
+  more.className = 's-more';
+  more.textContent = '⋯';
+  more.title = '更多操作';
+  more.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openSessionMenu(s.id, more.getBoundingClientRect(), item);
+  });
+  item.appendChild(more);
+
+  item.addEventListener('click', () => switchSession(s.id));
+  return item;
+}
+
+/* ---------- 会话菜单（⋯） ---------- */
+let menuTargetId = null;
+let menuTargetItem = null;
+
+function openSessionMenu(id, rect, itemEl) {
+  menuTargetId = id;
+  menuTargetItem = itemEl;
+  sessionMenuEl.classList.remove('hidden');
+  const mw = sessionMenuEl.offsetWidth;
+  const mh = sessionMenuEl.offsetHeight;
+  let x = rect.left + rect.width / 2 - mw / 2;
+  let y = rect.bottom + 6;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - 8 - mw;
+  if (x < 8) x = 8;
+  if (y + mh > window.innerHeight - 8) y = rect.top - mh - 6;
+  sessionMenuEl.style.left = x + 'px';
+  sessionMenuEl.style.top = y + 'px';
+}
+
+function hideSessionMenu() {
+  sessionMenuEl.classList.add('hidden');
+  menuTargetId = null;
+}
+
+document.addEventListener('click', (e) => {
+  if (!sessionMenuEl.classList.contains('hidden') &&
+      !sessionMenuEl.contains(e.target)) hideSessionMenu();
+});
+
+document.getElementById('menu-rename').addEventListener('click', () => {
+  if (!menuTargetId || !menuTargetItem) return;
+  startRename(menuTargetId, menuTargetItem);
+  hideSessionMenu();
+});
+
+document.getElementById('menu-delete').addEventListener('click', async () => {
+  const id = menuTargetId;
+  hideSessionMenu();
+  if (!id) return;
+  try {
+    const newCur = await invoke('delete_session', { id });
+    if (id === currentSid) {
+      // 删的是当前会话：后端已切到最近会话并备好消息，前端重绘
+      currentSid = newCur;
+      const msgs = await invoke('load_chat_history');
+      renderHistory(msgs, false);
+      updateTopbarTitle();
+    }
+    await refreshSessions();
+  } catch (e) {
+    addErrorBubble(String(e), { noRetry: true });
+  }
+});
+
+/* 行内重命名：标题换成输入框，Enter/失焦提交 */
+function startRename(id, itemEl) {
+  if (renamingId) return;
+  const s = sessionList.find((x) => x.id === id);
+  if (!s) return;
+  renamingId = id;
+  const titleEl = itemEl.querySelector('.s-title');
+  const input = document.createElement('input');
+  input.className = 's-rename';
+  input.value = s.title === '新对话' ? '' : s.title;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = async (save) => {
+    if (done) return;
+    done = true;
+    renamingId = null;
+    const val = input.value.trim();
+    input.replaceWith(titleEl);
+    if (save && val) {
+      try {
+        await invoke('rename_session', { id, title: val });
+        await refreshSessions();
+        updateTopbarTitle();
+      } catch (_) {}
+    } else {
+      renderSessions();
+    }
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') commit(false);
+    e.stopPropagation(); // 不触发全局快捷键
+  });
+  input.addEventListener('blur', () => commit(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+
+/* ---------- 会话切换 / 新建 ---------- */
+/* 清空消息区并按需渲染历史（空态模板可反复复用） */
+function renderHistory(msgs, withDivider) {
+  chatEl.innerHTML = '';
+  runningTools = {};
+  streamBubble = null;
+  const visible = (msgs || []).filter((m) =>
+    (m.role === 'user' || m.role === 'assistant') &&
+    typeof m.content === 'string' && m.content.trim());
+  if (visible.length) {
+    if (esTemplate && esTemplate.isConnected) esTemplate.remove();
+    if (withDivider) addDivider('历史消息');
+    for (const m of visible) addBubble(m.role === 'user' ? 'user' : 'ai', m.content);
+  } else if (esTemplate) {
+    esTemplate.classList.remove('hidden');
+    chatEl.appendChild(esTemplate);
+    renderChips(esTemplate, currentCmds.length ? currentCmds : DEFAULT_CMDS);
+  }
+  scrollChat(true);
+}
+
+function updateTopbarTitle() {
+  const cur = sessionList.find((s) => s.id === currentSid);
+  topbarTitleEl.textContent = cur ? (cur.title || '新对话') : 'VCC';
+}
+
+async function switchSession(id) {
+  if (id === currentSid || agentBusy) return;
+  try {
+    const msgs = await invoke('switch_session', { id });
+    currentSid = id;
+    renderHistory(msgs, true);
+    renderSessions();
+    updateTopbarTitle();
+  } catch (e) {
+    addErrorBubble(String(e), { noRetry: true });
+  }
+}
+
+/* ---------- 主题（body.dark / body.light，对齐 DeepSeek 机制） ---------- */
+let cachedCfg = {};
+
+function applyTheme(t) {
+  const dark = t !== 'light';
+  document.body.classList.toggle('dark', dark);
+  document.body.classList.toggle('light', !dark);
+  const label = document.getElementById('theme-label');
+  if (label) label.textContent = dark ? '浅色模式' : '深色模式';
+}
+
+document.getElementById('btn-theme').addEventListener('click', async () => {
+  const next = document.body.classList.contains('dark') ? 'light' : 'dark';
+  applyTheme(next);
+  try {
+    cachedCfg = await invoke('get_config');
+    cachedCfg.theme = next;
+    await invoke('save_config', { config: cachedCfg });
+  } catch (_) { /* 持久化失败时本次会话内仍然生效 */ }
+});
+
+/* ---------- 侧栏折叠 ---------- */
+document.getElementById('btn-collapse').addEventListener('click', () => {
+  document.body.classList.add('sb-collapsed');
+  try { localStorage.setItem('vcc-sb', '1'); } catch (_) {}
+});
+document.getElementById('btn-expand').addEventListener('click', () => {
+  document.body.classList.remove('sb-collapsed');
+  try { localStorage.setItem('vcc-sb', '0'); } catch (_) {}
+});
+
+/* ---------- 新对话（归档当前 → 切新会话） ---------- */
 document.getElementById('btn-new').addEventListener('click', async () => {
   if (agentBusy) return; // 执行中不允许清上下文
   if (chatEl.dataset.clearing) return;
   chatEl.dataset.clearing = '1';
   chatEl.classList.add('clearing');
   setTimeout(async () => {
-    // 摘下 empty-state 模板（innerHTML 清空会连带删掉它）
-    const es = document.getElementById('empty-state');
-    chatEl.innerHTML = '';
-    runningTools = {};
-    streamBubble = null;
-    if (es) {
-      es.classList.remove('hidden'); // 无历史 → 重新展示快捷指令
-      chatEl.appendChild(es);
+    try {
+      currentSid = await invoke('reset_history');
+    } catch (e) {
+      addErrorBubble(String(e), { noRetry: true });
     }
+    renderHistory([], false);
     chatEl.classList.remove('clearing');
     delete chatEl.dataset.clearing;
     setPhase('idle');
-    await invoke('reset_history'); // 后端归档会话精华入记忆
+    await refreshSessions();
+    updateTopbarTitle();
   }, 240);
 });
 
+/* ---------- 设置面板 ---------- */
 document.getElementById('btn-settings').addEventListener('click', async () => {
   const cfg = await invoke('get_config');
+  cachedCfg = cfg;
   document.getElementById('cfg-key').value = cfg.api_key || '';
   document.getElementById('cfg-url').value = cfg.base_url || '';
   document.getElementById('cfg-model').value = cfg.model || '';
@@ -596,6 +870,7 @@ document.getElementById('btn-settings').addEventListener('click', async () => {
   document.getElementById('cfg-topmost').checked = !!cfg.always_on_top;
   document.getElementById('cfg-vm').value = cfg.voice_model || 'fast';
   document.getElementById('cfg-vlang').value = cfg.voice_lang || 'zh';
+  document.getElementById('cfg-theme').value = cfg.theme || 'dark';
   document.getElementById('cfg-cmds').value = (cfg.custom_cmds || []).join('\n');
   /* 识别服务状态（排障：路径缺失 / server 是否已预热） */
   const vs = document.getElementById('voice-status');
@@ -645,13 +920,15 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
         autostart,
         always_on_top: topmost,
         voice_model: document.getElementById('cfg-vm').value,
-        voice_threads: cfg.voice_threads || 0,
+        voice_threads: cachedCfg.voice_threads || 0,
         voice_lang: document.getElementById('cfg-vlang').value,
         custom_cmds: document.getElementById('cfg-cmds').value.split('\n')
           .map((s) => s.trim()).filter(Boolean).slice(0, 8),
         tts_enabled: tts,
+        theme: document.getElementById('cfg-theme').value,
       },
     });
+    applyTheme(document.getElementById('cfg-theme').value);
     // 长期记忆（面板文本可手动编辑）
     await invoke('save_memory_cmd', { summary: document.getElementById('cfg-memory').value.trim() });
     // 保存即生效（不等重启）
@@ -691,27 +968,28 @@ document.getElementById('btn-clear-memory').addEventListener('click', async () =
 /* ---------- 启动 ---------- */
 window.addEventListener('DOMContentLoaded', async () => {
   const cfg = await invoke('get_config');
+  cachedCfg = cfg;
+  currentCmds = (cfg.custom_cmds && cfg.custom_cmds.length) ? cfg.custom_cmds : DEFAULT_CMDS;
   const demo = new URLSearchParams(location.search).get('demo');
-  if (!cfg.api_key && !demo) {
-    addBubble('ai', '你好，我是 VCC ⚡\n首次使用请先点右上角 ⚙ 填入 DeepSeek API Key。\n\n可以用语音或文字让我：调音量/亮度、点鼠标、开文件、跑命令…');
-  }
-  // 恢复上次对话（只渲染 user/assistant 文本气泡，工具中间轮不进 UI）
+  // 主题（body class 机制，加载即应用避免闪白；?theme= 供截图/调试覆盖）
+  const themeOverride = new URLSearchParams(location.search).get('theme');
+  applyTheme(themeOverride || cfg.theme || 'dark');
+  // 侧栏折叠状态（窄窗口默认收起）
+  let collapsed = false;
+  try { collapsed = localStorage.getItem('vcc-sb') === '1'; } catch (_) {}
+  if (window.innerWidth < 760) collapsed = true;
+  document.body.classList.toggle('sb-collapsed', collapsed);
+  // 恢复当前会话消息 + 会话列表（多会话存储）
   try {
     const hist = await invoke('load_chat_history');
-    const visible = hist.filter((m) =>
-      (m.role === 'user' || m.role === 'assistant') &&
-      typeof m.content === 'string' && m.content.trim());
-    if (visible.length) {
-      addDivider('上次对话');
-      for (const m of visible) addBubble(m.role === 'user' ? 'user' : 'ai', m.content);
-    }
+    renderHistory(hist, false);
   } catch (_) { /* 历史加载失败不阻塞启动 */ }
-  // 空状态：无历史无消息时展示快捷指令（演示模式除外）
-  const es = document.getElementById('empty-state');
-  if (es && !demo && !document.querySelector('#chat .bubble')) {
-    currentCmds = (cfg.custom_cmds && cfg.custom_cmds.length) ? cfg.custom_cmds : DEFAULT_CMDS;
-    renderChips(es, currentCmds);
-    es.classList.remove('hidden');
+  await refreshSessions();
+  updateTopbarTitle();
+  // 无 Key 引导（放在 renderHistory 之后，避免被清空；出现引导时隐藏空态）
+  if (!cfg.api_key && !demo) {
+    if (esTemplate && esTemplate.isConnected) esTemplate.remove();
+    addBubble('ai', '你好，我是 VCC ⚡\n首次使用请先点侧栏底部「设置」填入 DeepSeek API Key。\n\n可以用语音或文字让我：调音量/亮度、点鼠标、开文件、跑命令…');
   }
   ttsOn = !!cfg.tts_enabled;
   setPhase('idle');

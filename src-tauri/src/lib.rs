@@ -16,6 +16,8 @@ pub static APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new
 
 pub struct AppState {
     pub history: Mutex<Vec<ChatMessage>>,
+    /// 当前会话 id（多会话存储，sessions.json 的 current_id 运行时镜像）
+    pub current: Mutex<String>,
     /// agent 并发锁：同一时刻只允许一个 agent 轮次（防历史/流式状态竞争）
     pub busy: std::sync::atomic::AtomicBool,
 }
@@ -24,6 +26,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             history: Mutex::new(Vec::new()),
+            current: Mutex::new(String::new()),
             busy: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -49,13 +52,16 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
-            // 恢复上次对话历史（跨重启的对话流）
+            // 恢复多会话存储（跨重启的对话流；旧 history.json 自动迁移）
             // 必须在窗口创建之前：webview 页面加载后前端立刻 invoke('load_chat_history')，
             // 若晚于 setup_windows 会拿到空历史（实测时序竞争）
-            let hist = memory::load_history(app.handle());
+            let (sid, hist) = memory::load_history(app.handle());
             if let Some(state) = app.try_state::<AppState>() {
                 if let Ok(mut h) = state.history.lock() {
                     *h = hist;
+                }
+                if let Ok(mut c) = state.current.lock() {
+                    *c = sid;
                 }
             }
             setup_windows(app.handle())?;
@@ -171,6 +177,11 @@ pub fn run() {
             save_config,
             reset_history,
             load_chat_history,
+            list_sessions,
+            switch_session,
+            delete_session,
+            rename_session,
+            clear_all_sessions,
             get_memory,
             save_memory_cmd,
             hide_floating,
@@ -259,11 +270,11 @@ fn disable_system_backdrop(hwnd: isize) {
 }
 
 fn setup_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    // 主窗口（对话界面）
+    // 主窗口（对话界面）：DeepSeek 式布局（侧栏 + 消息流），默认更大、可自由缩放
     let main = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Voice Control for Class")
-        .inner_size(412.0, 672.0)
-        .min_inner_size(372.0, 552.0)
+        .inner_size(1020.0, 720.0)
+        .min_inner_size(620.0, 520.0)
         .decorations(false)
         .transparent(true)
         .shadow(false)  // Windows DWM 给透明窗口画的矩形阴影 = 卡片外的灰色方框，必须关
@@ -497,22 +508,131 @@ fn save_config(app: AppHandle, config: config::Config) -> Result<(), String> {
     Ok(())
 }
 
+/// 开启新对话：当前会话已在 save_history 持久化，这里只做「精华并入长期记忆 + 切新会话」
 #[tauri::command]
-fn reset_history(app: AppHandle) {
+fn reset_history(app: AppHandle) -> Result<String, String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(mut hist) = state.history.lock() {
-            // 新对话前：当前会话精华后台并入长期记忆（异步，不阻塞 UI）
-            if !hist.is_empty() {
-                let msgs = hist.clone();
-                let app2 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    memory::summarize_into_memory(app2, msgs).await;
-                });
-            }
-            hist.clear();
+        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一条指令还在执行中".into());
         }
+        let hist = state.history.lock().map(|h| h.clone()).unwrap_or_default();
+        // 当前会话精华后台并入长期记忆（异步，不阻塞 UI）
+        if hist.iter().any(|m| m.role == "user") {
+            let msgs = hist.clone();
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                memory::summarize_into_memory(app2, msgs).await;
+            });
+        }
+        if let Ok(mut h) = state.history.lock() {
+            h.clear();
+        }
+        let id = memory::new_session(&app);
+        if let Ok(mut c) = state.current.lock() {
+            *c = id.clone();
+        }
+        return Ok(id);
     }
-    memory::clear_history(&app);
+    Err("状态未就绪".into())
+}
+
+/// 会话列表（按更新时间倒序；附当前会话 id 供前端高亮）
+#[tauri::command]
+fn list_sessions(app: AppHandle) -> serde_json::Value {
+    let current = app
+        .try_state::<AppState>()
+        .and_then(|s| s.current.lock().ok().map(|c| c.clone()))
+        .unwrap_or_default();
+    serde_json::json!({
+        "current": current,
+        "list": memory::list_sessions(&app),
+    })
+}
+
+/// 切换会话：先写回当前，再载入目标会话消息（busy 时拒绝，防写回竞态）
+#[tauri::command]
+fn switch_session(app: AppHandle, id: String) -> Result<Vec<ChatMessage>, String> {
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一条指令还在执行中，请稍候再切换".into());
+        }
+        // 写回当前会话
+        let cur = state.current.lock().map(|c| c.clone()).unwrap_or_default();
+        if !cur.is_empty() && cur != id {
+            let hist = state.history.lock().map(|h| h.clone()).unwrap_or_default();
+            memory::save_history(&app, &hist);
+        }
+        let msgs = memory::switch_session(&app, &id)?;
+        if let Ok(mut h) = state.history.lock() {
+            *h = msgs.clone();
+        }
+        if let Ok(mut c) = state.current.lock() {
+            *c = id;
+        }
+        return Ok(msgs);
+    }
+    Err("状态未就绪".into())
+}
+
+/// 删除会话；若删的是当前会话则切到最近的其它会话（无会话则新建空的）
+#[tauri::command]
+fn delete_session(app: AppHandle, id: String) -> Result<String, String> {
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一条指令还在执行中，请稍候再删除".into());
+        }
+        let cur = state.current.lock().map(|c| c.clone()).unwrap_or_default();
+        if cur == id {
+            // 删当前：先清运行时历史再删，避免 save_history 复活它
+            if let Ok(mut h) = state.history.lock() {
+                h.clear();
+            }
+        }
+        let new_cur = memory::delete_session(&app, &id);
+        let final_id = if new_cur.is_empty() {
+            memory::new_session(&app)
+        } else {
+            new_cur
+        };
+        if cur == id {
+            let msgs = memory::switch_session(&app, &final_id).unwrap_or_default();
+            if let Ok(mut h) = state.history.lock() {
+                *h = msgs;
+            }
+        }
+        if let Ok(mut c) = state.current.lock() {
+            *c = final_id.clone();
+        }
+        return Ok(final_id);
+    }
+    Err("状态未就绪".into())
+}
+
+/// 重命名会话
+#[tauri::command]
+fn rename_session(app: AppHandle, id: String, title: String) -> Result<(), String> {
+    memory::rename_session(&app, &id, &title);
+    Ok(())
+}
+
+/// 清空全部对话（保留长期记忆）
+#[tauri::command]
+fn clear_all_sessions(app: AppHandle) -> Result<String, String> {
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一条指令还在执行中".into());
+        }
+        if let Ok(mut h) = state.history.lock() {
+            h.clear();
+        }
+        memory::clear_all_sessions(&app);
+        let id = memory::new_session(&app);
+        if let Ok(mut c) = state.current.lock() {
+            *c = id.clone();
+        }
+        return Ok(id);
+    }
+    Err("状态未就绪".into())
 }
 
 /// 启动恢复：把持久化历史交给前端渲染（tool 中间轮由前端过滤）

@@ -1,5 +1,5 @@
 /* ---------- 对话历史持久化 + AI 长期记忆 ---------- */
-/* history.json: 每轮 agent 结束后落盘，启动时恢复（跨重启的对话流）
+/* sessions.json: 多会话存储（id/标题/时间/消息），对标 chat.deepseek.com 的会话列表
    memory.json:  AI 自动总结的长期记忆（用户偏好/设备环境/常用指令），注入 system prompt */
 
 use crate::llm::ChatMessage;
@@ -19,7 +19,11 @@ fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(data_dir(app)?.join("sessions.json"))
+}
+
+fn legacy_history_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("history.json"))
 }
 
@@ -27,29 +31,225 @@ fn memory_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("memory.json"))
 }
 
-/* ---------- 对话历史 ---------- */
+/* ---------- 多会话存储 ---------- */
 
-pub fn save_history(app: &AppHandle, hist: &[ChatMessage]) {
-    let Ok(path) = history_path(app) else { return };
-    if let Ok(json) = serde_json::to_string(hist) {
-        let _ = fs::write(path, json);
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
 }
 
-pub fn load_history(app: &AppHandle) -> Vec<ChatMessage> {
-    let Ok(path) = history_path(app) else {
-        return Vec::new();
+/// 会话列表项（轻量，不含消息体）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub title: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionsFile {
+    #[serde(default)]
+    current_id: String,
+    #[serde(default)]
+    sessions: Vec<Session>,
+}
+
+fn gen_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("s-{nanos:032x}")
+}
+
+/// 读取会话文件；首次运行时把旧版单文件 history.json 迁移成一个会话
+fn load_sessions_file(app: &AppHandle) -> SessionsFile {
+    if let Ok(path) = sessions_path(app) {
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Ok(f) = serde_json::from_str::<SessionsFile>(&s) {
+                return f;
+            }
+        }
+    }
+    // 迁移：旧 history.json → 单个会话（标题「历史对话」）
+    let legacy = if let Ok(p) = legacy_history_path(app) {
+        fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<ChatMessage>>(&s).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let mut file = SessionsFile::default();
+    if !legacy.is_empty() {
+        let id = gen_session_id();
+        file.current_id = id.clone();
+        file.sessions.push(Session {
+            id,
+            title: "历史对话".into(),
+            created_at: crate::llm::chrono_now_cn(),
+            updated_at: crate::llm::chrono_now_cn(),
+            messages: legacy,
+        });
+    }
+    persist_sessions_file(app, &file);
+    let _ = fs::remove_file(legacy_history_path(app).unwrap_or_default()); // 迁移完成即清理
+    file
 }
 
-pub fn clear_history(app: &AppHandle) {
-    if let Ok(path) = history_path(app) {
-        let _ = fs::remove_file(path);
+fn persist_sessions_file(app: &AppHandle, file: &SessionsFile) {
+    if let Ok(path) = sessions_path(app) {
+        if let Ok(json) = serde_json::to_string_pretty(file) {
+            let _ = fs::write(path, json);
+        }
     }
+}
+
+/// 把运行时历史写回当前会话（agent 轮次结束落盘 + 切换会话前保存）
+pub fn save_history(app: &AppHandle, hist: &[ChatMessage]) {
+    let mut file = load_sessions_file(app);
+    if file.current_id.is_empty() {
+        if hist.is_empty() {
+            return;
+        }
+        let id = gen_session_id();
+        file.current_id = id.clone();
+        file.sessions.push(Session {
+            id,
+            title: String::new(),
+            created_at: crate::llm::chrono_now_cn(),
+            updated_at: crate::llm::chrono_now_cn(),
+            messages: Vec::new(),
+        });
+    }
+    if let Some(s) = file.sessions.iter_mut().find(|s| s.id == file.current_id) {
+        s.messages = hist.to_vec();
+        s.updated_at = crate::llm::chrono_now_cn();
+        // 自动标题：未命名会话用第一条用户消息截 24 字
+        if s.title.trim().is_empty() {
+            if let Some(first) = hist.iter().find(|m| m.role == "user") {
+                if let Some(c) = &first.content {
+                    let t: String = c.trim().chars().take(24).collect();
+                    if !t.is_empty() {
+                        s.title = t;
+                    }
+                }
+            }
+        }
+    }
+    persist_sessions_file(app, &file);
+}
+
+/// 启动恢复：返回当前会话的运行时历史
+pub fn load_history(app: &AppHandle) -> (String, Vec<ChatMessage>) {
+    let mut file = load_sessions_file(app);
+    if file.sessions.is_empty() {
+        persist_sessions_file(app, &file);
+        return (String::new(), Vec::new());
+    }
+    if file.current_id.is_empty() || !file.sessions.iter().any(|s| s.id == file.current_id) {
+        // 指向失效 → 取最近更新的会话
+        if let Some(latest) = file
+            .sessions
+            .iter()
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+        {
+            file.current_id = latest.id.clone();
+            persist_sessions_file(app, &file);
+        }
+    }
+    let msgs = file
+        .sessions
+        .iter()
+        .find(|s| s.id == file.current_id)
+        .map(|s| s.messages.clone())
+        .unwrap_or_default();
+    (file.current_id, msgs)
+}
+
+/// 会话列表（按更新时间倒序）
+pub fn list_sessions(app: &AppHandle) -> Vec<SessionMeta> {
+    let mut metas: Vec<SessionMeta> = load_sessions_file(app)
+        .sessions
+        .into_iter()
+        .map(|s| SessionMeta {
+            id: s.id,
+            title: if s.title.trim().is_empty() {
+                "新对话".into()
+            } else {
+                s.title
+            },
+            updated_at: s.updated_at,
+        })
+        .collect();
+    metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    metas
+}
+
+/// 新建会话并切换：返回新会话 id（调用方负责先把旧历史写回）
+pub fn new_session(app: &AppHandle) -> String {
+    let mut file = load_sessions_file(app);
+    let id = gen_session_id();
+    file.sessions.push(Session {
+        id: id.clone(),
+        title: String::new(),
+        created_at: crate::llm::chrono_now_cn(),
+        updated_at: crate::llm::chrono_now_cn(),
+        messages: Vec::new(),
+    });
+    file.current_id = id.clone();
+    persist_sessions_file(app, &file);
+    id
+}
+
+/// 切换会话：返回该会话消息（调用方先写回旧会话）
+pub fn switch_session(app: &AppHandle, id: &str) -> Result<Vec<ChatMessage>, String> {
+    let mut file = load_sessions_file(app);
+    let Some(s) = file.sessions.iter().find(|s| s.id == id) else {
+        return Err("会话不存在".into());
+    };
+    let msgs = s.messages.clone();
+    file.current_id = id.to_string();
+    persist_sessions_file(app, &file);
+    Ok(msgs)
+}
+
+/// 删除会话：若删的是当前会话则自动切到最近更新的；返回新的 current_id（可为空 = 无会话）
+pub fn delete_session(app: &AppHandle, id: &str) -> String {
+    let mut file = load_sessions_file(app);
+    file.sessions.retain(|s| s.id != id);
+    if file.current_id == id {
+        file.current_id = file
+            .sessions
+            .iter()
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+    }
+    persist_sessions_file(app, &file);
+    file.current_id
+}
+
+/// 重命名会话
+pub fn rename_session(app: &AppHandle, id: &str, title: &str) {
+    let mut file = load_sessions_file(app);
+    if let Some(s) = file.sessions.iter_mut().find(|s| s.id == id) {
+        let t = title.trim();
+        s.title = if t.is_empty() { "新对话".into() } else { t.chars().take(40).collect() };
+    }
+    persist_sessions_file(app, &file);
+}
+
+/// 清空全部会话（设置里「清除所有对话」；记忆不受影响）
+pub fn clear_all_sessions(app: &AppHandle) {
+    persist_sessions_file(app, &SessionsFile::default());
 }
 
 /* ---------- AI 长期记忆 ---------- */
