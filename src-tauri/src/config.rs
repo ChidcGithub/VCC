@@ -82,16 +82,9 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("config.json"))
 }
 
+/// 读取配置；解析失败时把坏文件改名 .bad 保留现场再回落默认
+/// （否则下次 save 用默认配置覆盖，API Key 被静默抹掉）
 pub fn load(app: &AppHandle) -> Config {
-    config_path(app)
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// load 的损坏防护版：解析失败时把坏文件改名 .bad 保留现场再回落默认
-pub fn load_safe(app: &AppHandle) -> Config {
     let parsed = config_path(app).ok().and_then(|p| {
         fs::read_to_string(&p)
             .ok()

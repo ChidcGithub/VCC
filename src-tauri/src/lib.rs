@@ -650,9 +650,21 @@ fn delete_session(app: AppHandle, id: String) -> Result<String, String> {
 #[tauri::command]
 fn rename_session(app: AppHandle, id: String, title: String) -> Result<(), String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+        // CAS 占住（与其他会话命令一致：check-then-act 有窗口，且 rename 与
+        // agent 收尾的 save_history 并发读改写 sessions.json 会丢更新）
+        if state
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Err("上一条指令还在执行中，请稍候再重命名".into());
         }
+        let _guard = BusyGuard(&state.busy);
         memory::rename_session(&app, &id, &title);
         return Ok(());
     }

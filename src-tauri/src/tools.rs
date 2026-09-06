@@ -710,10 +710,25 @@ async fn show_dialog(v: &Value) -> ToolResult {
 
 /* ================= 剪贴板 ================= */
 
+/// 打开剪贴板带重试：输入法/剪贴板管理器/截屏工具短暂占用是高频场景
+#[cfg(windows)]
+unsafe fn open_clipboard_retry() -> Result<(), String> {
+    use windows::Win32::System::DataExchange::OpenClipboard;
+    let mut err = String::new();
+    for _ in 0..8 {
+        match OpenClipboard(None) {
+            Ok(()) => return Ok(()),
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(format!("打开剪贴板失败（重试 8 次仍被占用）: {err}"))
+}
+
 #[cfg(windows)]
 pub fn clipboard_get() -> ToolResult {
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
     };
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
@@ -721,7 +736,7 @@ pub fn clipboard_get() -> ToolResult {
         if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_err() {
             return Ok("剪贴板里没有文本".into());
         }
-        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+        open_clipboard_retry()?;
         let inner = (|| -> Result<String, String> {
             let h = GetClipboardData(CF_UNICODETEXT.0 as u32)
                 .map_err(|e| format!("读剪贴板失败: {e}"))?;
@@ -754,27 +769,31 @@ pub fn clipboard_get() -> ToolResult {
 pub fn clipboard_set(text: &str) -> ToolResult {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, SetClipboardData,
     };
+    use windows::Win32::Foundation::GlobalFree;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     wide.push(0);
     unsafe {
-        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+        open_clipboard_retry()?;
         let inner = (|| -> Result<(), String> {
             EmptyClipboard().map_err(|e| format!("清空剪贴板失败: {e}"))?;
             let h = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)
                 .map_err(|e| format!("内存分配失败: {e}"))?;
             let ptr = GlobalLock(h) as *mut u16;
             if ptr.is_null() {
+                let _ = GlobalFree(Some(h));
                 return Err("GlobalLock 失败".into());
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(h);
-            // 成功后系统接管内存，不得 GlobalFree
-            SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0)))
-                .map_err(|e| format!("写入剪贴板失败: {e}"))?;
+            // 失败时系统未接管内存，必须回收防泄漏；成功后系统接管，不得 GlobalFree
+            if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0))).is_err() {
+                let _ = GlobalFree(Some(h));
+                return Err("写入剪贴板失败".into());
+            }
             Ok(())
         })();
         let _ = CloseClipboard();

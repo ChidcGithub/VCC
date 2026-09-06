@@ -224,7 +224,7 @@ async function send(text) {
   if (!text) return;
   if (agentBusy) {
     // 不吞输入：语音识别出的文本放回输入条（文字输入时本来就还在），稍后可手动发
-    if (inputEl.value !== text) { inputEl.value = text; autoGrow(); }
+    if (!inputEl.value) { inputEl.value = text; autoGrow(); } // 输入框为空才回填识别文本，不打扰草稿
     // 状态行轻提示 1.5s
     phaseEl.textContent = '上一条还在执行中…';
     phaseEl.classList.remove('empty');

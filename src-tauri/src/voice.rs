@@ -140,6 +140,17 @@ fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // 先验明正身：server.json 里的 pid 可能已被系统复用，盲杀会误伤无关进程
+        let is_ours = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("whisper-server"))
+            .unwrap_or(false);
+        if !is_ours {
+            return;
+        }
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .creation_flags(0x08000000)
@@ -149,12 +160,20 @@ fn kill_pid(pid: u32) {
 
 /// 探活：有 HTTP 响应（任意状态码）即认为 server 活着
 fn probe(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
     let addr = format!("127.0.0.1:{port}");
-    std::net::TcpStream::connect(&addr)
-        .map(|s| {
-            // TCP 通了还不够稳，发一个最小 HTTP 请求确认是我们的 server
-            use std::io::{Read, Write};
-            let mut s = s;
+    let ok: std::net::SocketAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&ok, Duration::from_secs(2))
+        .map(|mut s| {
+            // TCP 通了还不够稳，发一个最小 HTTP 请求确认是我们的 server；
+            // 端口被其他程序占用时超时退出，不能在 async 上下文里无限阻塞
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(format!("GET / HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes());
             let mut buf = [0u8; 16];
             matches!(s.read(&mut buf), Ok(n) if n > 0)
@@ -162,8 +181,12 @@ fn probe(port: u16) -> bool {
         .unwrap_or(false)
 }
 
+static ENSURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 确保有可用的 whisper-server，返回端口。复用旧实例（含孤儿），失败则启动新的。
 async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
+    // 互斥：「检查+启动」全程串行，防止 warmup 与并发 transcribe 各拉起一个 server
+    let _serial = ENSURING.lock().await;
     let model_name = model_file(cfg.voice_model.as_str()).to_string();
     let lang = if cfg.voice_lang.is_empty() { "zh".to_string() } else { cfg.voice_lang.clone() };
 
@@ -425,9 +448,11 @@ pub async fn transcribe(wav_base64: &str) -> Result<String, String> {
         return Err("录音数据为空".into());
     }
 
+    static WAV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
-        "vcc_rec_{}.wav",
-        std::process::id() as u64 + chrono_millis()
+        "vcc_rec_{}_{}.wav",
+        std::process::id(),
+        WAV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
 
@@ -474,12 +499,7 @@ fn finalize_text(t: String) -> Result<String, String> {
     Ok(t)
 }
 
-fn chrono_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_millis() as u64)
-        .unwrap_or(0)
-}
+
 
 /// 预热检查 + 基准（供诊断：invoke('probe_env')）
 #[tauri::command]

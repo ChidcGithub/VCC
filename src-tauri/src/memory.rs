@@ -110,7 +110,12 @@ fn load_sessions_file(app: &AppHandle) -> SessionsFile {
 
 /// 原子写：临时文件 + rename 替换（进程中途被杀/断电不留半截 JSON）
 fn atomic_write(path: &std::path::Path, data: &str) {
-    let tmp = path.with_extension("json.tmp");
+    // tmp 名带纳秒+pid：未串行化的并发写对（如后台总结 vs 手动清记忆）不互踩临时文件
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("json.{:x}.{}.tmp", nanos, std::process::id()));
     if fs::write(&tmp, data).is_ok() {
         let _ = fs::rename(&tmp, path);
     }

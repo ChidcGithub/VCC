@@ -262,6 +262,9 @@ async fn chat_completion_stream(
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("流中断: {e}"))?;
         buf.extend_from_slice(&bytes);
+        // CRLF 归一化：部分代理/兼容服务用 \r\n\r\n 分隔事件，只匹配 \n\n 会永远匹配不上
+        // （UTF-8 多字节序列不包含 0x0D，去掉 \r 不会破坏中文）
+        buf.retain(|&b| b != b'\r');
 
         while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
             let drained: Vec<u8> = buf.drain(..pos + 2).collect();
