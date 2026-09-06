@@ -9,6 +9,7 @@ const stepsEl = document.getElementById('f-steps');
 const textEl = document.getElementById('f-text');
 
 let fadeTimer = null;
+let hideTimer = null;
 
 function resizeToFit() {
   try {
@@ -21,6 +22,7 @@ function resizeToFit() {
 
 function render(payload) {
   clearTimeout(fadeTimer);
+  clearTimeout(hideTimer); // 内层 hide 也要撤：淡出窗口期内新任务 show 会被 450ms 后的隐藏误杀
   card.classList.remove('fade');
 
   if (payload.mode === 'show' || payload.mode === 'done') {
@@ -58,7 +60,7 @@ function render(payload) {
       // 完成 → 5 秒后淡出 → 隐藏窗口
       fadeTimer = setTimeout(async () => {
         card.classList.add('fade');
-        setTimeout(() => invoke('hide_floating'), 450);
+        hideTimer = setTimeout(() => invoke('hide_floating'), 450);
       }, 5000);
     }
   }

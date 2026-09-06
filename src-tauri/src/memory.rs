@@ -73,8 +73,12 @@ fn gen_session_id() -> String {
 fn load_sessions_file(app: &AppHandle) -> SessionsFile {
     if let Ok(path) = sessions_path(app) {
         if let Ok(s) = fs::read_to_string(&path) {
-            if let Ok(f) = serde_json::from_str::<SessionsFile>(&s) {
-                return f;
+            match serde_json::from_str::<SessionsFile>(&s) {
+                Ok(f) => return f,
+                Err(_) => {
+                    // 损坏文件保留现场（.bad）供人工恢复，绝不用空文件覆盖
+                    let _ = fs::rename(&path, path.with_extension("json.bad"));
+                }
             }
         }
     }
@@ -104,10 +108,18 @@ fn load_sessions_file(app: &AppHandle) -> SessionsFile {
     file
 }
 
+/// 原子写：临时文件 + rename 替换（进程中途被杀/断电不留半截 JSON）
+fn atomic_write(path: &std::path::Path, data: &str) {
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, data).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
 fn persist_sessions_file(app: &AppHandle, file: &SessionsFile) {
     if let Ok(path) = sessions_path(app) {
         if let Ok(json) = serde_json::to_string_pretty(file) {
-            let _ = fs::write(path, json);
+            atomic_write(&path, &json);
         }
     }
 }
@@ -280,7 +292,7 @@ pub fn save_memory(app: &AppHandle, summary: &str) {
         updated_at: crate::llm::chrono_now_cn(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
-        let _ = fs::write(path, json);
+        atomic_write(&path, &json);
     }
 }
 
@@ -330,11 +342,17 @@ fn render_transcript(msgs: &[ChatMessage]) -> String {
     }
 }
 
+static SUMMARIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 后台总结入口：永不 panic、失败静默——记忆是增强功能，绝不干扰主对话流程。
 pub async fn summarize_into_memory(app: AppHandle, msgs: Vec<ChatMessage>) {
-    if let Err(_e) = summarize_inner(&app, &msgs).await {
-        // 静默：网络故障/无 Key 时不弹错、不打断
+    // 单飞：总结耗时可达分钟级，并发触发时都读同一份旧记忆再整文件覆盖，
+    // 后写者会抹掉先写者的成果——后到的直接跳过
+    if SUMMARIZING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
+    let _ = summarize_inner(&app, &msgs).await; // 静默：网络故障/无 Key 时不弹错
+    SUMMARIZING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn summarize_inner(app: &AppHandle, msgs: &[ChatMessage]) -> Result<(), String> {

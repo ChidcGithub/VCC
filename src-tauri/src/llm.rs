@@ -247,7 +247,9 @@ async fn chat_completion_stream(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // 字节缓冲：多字节 UTF-8（中文）被 TCP 分包切在 chunk 边界时，
+    // 逐 chunk from_utf8_lossy 会产生 U+FFFD 永久乱码——事件边界处整段解码才安全
+    let mut buf: Vec<u8> = Vec::new();
     let mut content_acc = String::new();
     let mut streaming = false;
     // delta 合并：33ms 批量 emit（DeepSeek 每 chunk 1-3 字太碎，直发会打爆 IPC）
@@ -259,10 +261,11 @@ async fn chat_completion_stream(
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("流中断: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.extend_from_slice(&bytes);
 
-        while let Some(pos) = buf.find("\n\n") {
-            let event: String = buf.drain(..pos + 2).collect();
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let drained: Vec<u8> = buf.drain(..pos + 2).collect();
+            let event = String::from_utf8_lossy(&drained).into_owned();
             for line in event.lines() {
                 let data = match line.strip_prefix("data:") {
                     Some(d) => d.trim(),
@@ -320,7 +323,9 @@ async fn chat_completion_stream(
     if !delta_buf.is_empty() {
         let _ = app.emit("vcc://chat-delta", json!({"text": delta_buf}));
     }
-    let _ = app.emit("vcc://chat-end", json!({}));
+    // chat-end 不在这里发：流函数每轮调用，每轮都发会让前端把中间工具轮
+    // 误判为回答结束（phase 闪 done→idle 抖动）；最终轮由 run_agent 统一发，
+    // 失败路径由 lib.rs agent_run 补发。
 
     let tool_calls = if tools_acc.is_empty() {
         None
@@ -397,6 +402,11 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
             // 上下文压缩：只保留最近 60 条，被裁掉的旧消息后台并入长期记忆
             let l = hist.len();
             let dropped: Vec<ChatMessage> = hist.drain(..l - 60).collect();
+            // 裁剪不得切断 assistant(tool_calls) 与 role=tool 的配对：
+            // 保留区开头若是孤立 tool 消息，继续前吞到配对边界，否则请求持续 400
+            while hist.first().map(|m| m.role == "tool").unwrap_or(false) {
+                hist.remove(0);
+            }
             if !dropped.is_empty() {
                 let app2 = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -416,6 +426,8 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
     let mut steps: Vec<Value> = Vec::new();
     let mut rounds = 0;
 
+    // 主体包进 async block：失败路径统一走回滚（重试不产生重复 user 轮次）
+    let result: Result<(), String> = async {
     loop {
         rounds += 1;
         if rounds > 10 {
@@ -474,9 +486,30 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
         if answer.trim().is_empty() || answer == "（已完成）" {
             let _ = app.emit("vcc://chat", json!({"role": "ai", "text": "✓ 已执行完成"}));
         }
+        // 最终流结束信号：仅整次回答结束发一次（前端渲染 markdown + TTS + 完成绽放）
+        let _ = app.emit("vcc://chat-end", json!({}));
         let _ = app.emit("vcc://float", json!({"mode": "done", "steps": steps, "text": answer}));
         // done（而非直接 idle）：主窗完成绽放 + 跑马灯淡出；900ms 后由前端统一回落 idle
         let _ = app.emit("vcc://phase", json!({"phase": "done"}));
         return Ok(());
     }
+    }.await;
+
+    if result.is_err() {
+        // 回滚：把本次 push 的 user 消息弹出并落盘（API 失败/流中断不留残轮，
+        // 且防止重试后历史里出现两条相同指令）
+        if let Some(state) = app.try_state::<crate::AppState>() {
+            if let Ok(mut hist) = state.history.lock() {
+                let is_ours = hist
+                    .last()
+                    .map(|m| m.role == "user" && m.content.as_deref() == Some(text.as_str()))
+                    .unwrap_or(false);
+                if is_ours {
+                    hist.pop();
+                    crate::memory::save_history(app, &hist);
+                }
+            }
+        }
+    }
+    result
 }

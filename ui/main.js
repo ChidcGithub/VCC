@@ -223,7 +223,9 @@ async function send(text) {
   text = (text || '').trim();
   if (!text) return;
   if (agentBusy) {
-    // 静默吞输入会让人困惑：状态行轻提示 1.5s，输入内容保留
+    // 不吞输入：语音识别出的文本放回输入条（文字输入时本来就还在），稍后可手动发
+    if (inputEl.value !== text) { inputEl.value = text; autoGrow(); }
+    // 状态行轻提示 1.5s
     phaseEl.textContent = '上一条还在执行中…';
     phaseEl.classList.remove('empty');
     clearTimeout(sendBusyTimer);
@@ -361,10 +363,6 @@ listen('vcc://invoked', () => {
   document.body.classList.add('summon');
 });
 
-listen('vcc://transcript', (e) => {
-  showTranscript(e.payload.text);
-});
-
 /* AI 长期记忆后台更新完成（上下文压缩 / 新对话归档时触发） */
 listen('vcc://memory-updated', () => {
   addDivider('记忆已更新');
@@ -408,12 +406,19 @@ function ding(freq = 880, dur = 0.09, gain = 0.045) {
   } catch (_) { /* 音频失败静默 */ }
 }
 
+let recWanting = false; // getUserMedia 授权等待期的意图标志：期间双击/松手都不泄漏流
 async function startRecording() {
-  if (recorder) return; // 防双击/重复 pointerdown 泄漏麦克风流
+  if (recorder || recWanting) return; // 防双击/重复 pointerdown 泄漏麦克风流
+  recWanting = true;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
+    if (!recWanting) {
+      // 授权等待期间已松手：立即释放流，不进入录音
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
     const ctx = new AudioContext();
     const src = ctx.createMediaStreamSource(stream);
     // Whisper 需要 16kHz 单声道 Int16
@@ -461,11 +466,13 @@ async function startRecording() {
     pump();
   } catch (e) {
     addErrorBubble('无法访问麦克风：' + e, { noRetry: true });
+  } finally {
+    recWanting = false;
   }
 }
 
 async function stopRecording() {
-  if (!recorder) return;
+  if (!recorder) { recWanting = false; return; } // 授权等待期松手：撤销意图，流拿到即释放
   const r = recorder;
   recorder = null;
   document.body.classList.remove('recording');
@@ -772,6 +779,8 @@ function renderHistory(msgs, withDivider) {
   chatEl.innerHTML = '';
   runningTools = {};
   streamBubble = null;
+  lastUserText = ''; // 重试按钮不得跨会话重发旧指令
+  for (const k of Object.keys(toolStarts)) delete toolStarts[k];
   const visible = (msgs || []).filter((m) =>
     (m.role === 'user' || m.role === 'assistant') &&
     typeof m.content === 'string' && m.content.trim());
@@ -812,6 +821,7 @@ function applyTheme(t) {
   const dark = t !== 'light';
   document.body.classList.toggle('dark', dark);
   document.body.classList.toggle('light', !dark);
+  try { localStorage.setItem('vcc-theme', dark ? 'dark' : 'light'); } catch (_) {}
   const label = document.getElementById('theme-label');
   if (label) label.textContent = dark ? '浅色模式' : '深色模式';
   // 图标与标签同步指向「点击后进入的模式」（深色时显示太阳，浅色时显示月亮）
@@ -849,7 +859,11 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     try {
       currentSid = await invoke('reset_history');
     } catch (e) {
+      // 后端拒绝（busy）时保留当前对话：清掉正在流式输出的气泡再让 delta 重长会错乱
       addErrorBubble(String(e), { noRetry: true });
+      chatEl.classList.remove('clearing');
+      delete chatEl.dataset.clearing;
+      return;
     }
     renderHistory([], false);
     chatEl.classList.remove('clearing');
@@ -879,13 +893,15 @@ document.getElementById('btn-settings').addEventListener('click', async () => {
   const vs = document.getElementById('voice-status');
   if (vs) {
     vs.textContent = '识别服务：检测中…';
+    const seq = (vs.dataset.seq = String(Number(vs.dataset.seq || 0) + 1));
     invoke('probe_env').then((info) => {
+      if (vs.dataset.seq !== seq) return; // 旧请求后到，让位给新一轮检测
       const m = /端口 (\d+)/.exec(String(info));
       vs.textContent = m && m[1] !== '0'
         ? '识别服务：运行中（端口 ' + m[1] + '）'
         : '识别服务：待命（首次语音时自动拉起）';
     }).catch(() => {
-      vs.textContent = '识别服务：环境缺失（未找到 tools/whisper）';
+      if (vs.dataset.seq === seq) vs.textContent = '识别服务：环境缺失（未找到 tools/whisper）';
     });
   }
   /* 长期记忆内容（可手动编辑，保存时一并提交） */
@@ -941,15 +957,11 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     // 快捷指令即时生效（空态有胶囊时重建）
     currentCmds = document.getElementById('cfg-cmds').value.split('\n')
       .map((s) => s.trim()).filter(Boolean).slice(0, 8);
-    const esNow = document.getElementById('empty-state');
-    if (esNow) renderChips(esNow, currentCmds.length ? currentCmds : DEFAULT_CMDS);
-    // 配完 Key 回到界面：若无任何消息则把空态请回来（新手闭环）
-    if (!document.querySelector('#chat .bubble')) {
-      const es2 = document.getElementById('empty-state');
-      if (es2) {
-        renderChips(es2, currentCmds.length ? currentCmds : DEFAULT_CMDS);
-        es2.classList.remove('hidden');
-      }
+    // 空态恢复必须走常驻引用 esTemplate：节点可能已从 DOM 摘除，getElementById 拿不到
+    if (!document.querySelector('#chat .bubble') && esTemplate) {
+      if (!esTemplate.isConnected) chatEl.appendChild(esTemplate);
+      esTemplate.classList.remove('hidden');
+      renderChips(esTemplate, currentCmds.length ? currentCmds : DEFAULT_CMDS);
     }
     setTimeout(() => {
       document.getElementById('settings').classList.add('hidden');
@@ -1009,7 +1021,6 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   /* 演示模式：index.html?demo=listening|thinking|executing 供截图对比 */
   if (demo) {
-    document.body.classList.add('preview');
     addBubble('user', '把音量调到 30，然后打开 D 盘的课件文件夹');
     const t1 = addToolLine('设置系统音量 → 30%');
     finishToolLine(t1, true, 812);

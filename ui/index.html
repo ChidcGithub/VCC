@@ -4,6 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VCC</title>
+  <script>
+    // 主题预读：浅色用户首帧即为 light（main.js 的 applyTheme 要等异步 get_config，
+    // 直接跳变会闪一帧深色；localStorage 由 applyTheme 同步维护）
+    try {
+      if (localStorage.getItem('vcc-theme') === 'light') {
+        document.addEventListener('DOMContentLoaded', function () {
+          document.body.classList.remove('dark');
+          document.body.classList.add('light');
+        });
+      }
+    } catch (e) {}
+  </script>
   <link rel="stylesheet" href="icons.css" />
   <link rel="stylesheet" href="style.css" />
 </head>

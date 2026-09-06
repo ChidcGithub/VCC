@@ -90,8 +90,29 @@ pub fn load(app: &AppHandle) -> Config {
         .unwrap_or_default()
 }
 
+/// load 的损坏防护版：解析失败时把坏文件改名 .bad 保留现场再回落默认
+pub fn load_safe(app: &AppHandle) -> Config {
+    let parsed = config_path(app).ok().and_then(|p| {
+        fs::read_to_string(&p)
+            .ok()
+            .map(|s| (p, serde_json::from_str::<Config>(&s).ok()))
+    });
+    match parsed {
+        Some((_, Some(cfg))) => cfg,
+        Some((p, None)) => {
+            let _ = fs::rename(&p, p.with_extension("json.bad"));
+            Config::default()
+        }
+        None => Config::default(),
+    }
+}
+
 pub fn save(app: &AppHandle, cfg: &Config) -> Result<(), String> {
     let path = config_path(app)?;
     let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    // 原子写：临时文件 + rename 替换（进程中途被杀不留半截 JSON，
+    // 半截 JSON 会让下次 load 回落默认配置、API Key 被静默抹掉）
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }

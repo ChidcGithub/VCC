@@ -190,7 +190,9 @@ async fn powershell_raw(script: &str) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // 超时放弃 output() future 时同步杀掉子进程（默认 kill_on_drop=false 会留孤儿继续跑）
+        .kill_on_drop(true);
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);
@@ -403,7 +405,8 @@ async fn powershell_file(script_path: &str, args: &[&str]) -> Result<String, Str
         .arg(script_path)
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true); // 超时孤儿防护，同 powershell_raw
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);
@@ -697,7 +700,10 @@ async fn show_dialog(v: &Value) -> ToolResult {
             p.buttons.get((id - 1001) as usize).cloned().unwrap_or_else(|| "?".into())
         ),
         2 => "用户按 Esc 关闭了弹窗（未选择）".into(),
-        0 => format!("弹窗 {} 秒内未得到响应，已自动关闭", p.timeout_secs),
+        0 => format!(
+            "弹窗 {} 秒内未得到响应，可能仍停留在屏幕上，请提示用户手动关闭",
+            p.timeout_secs
+        ),
         _ => "弹窗已关闭（未选择）".into(),
     })
 }
@@ -1041,6 +1047,9 @@ const BLOCKED_PATTERNS: &[&str] = &[
     "stop-computer", "restart-computer", "reg delete", "reg add", "vssadmin",
     "bcdedit", "clear-disk", "initialize-disk", "invoke-expression", "iex ",
     "iex(", "|iex", "| iex", "start-process -verb runas",
+    // 编码执行类：powershell -EncodedCommand <b64> 的命令体是 Base64，
+    // 明文匹配全部失效，必须连编码通道一起拦
+    "encodedcommand", " -enc ", " -ec ", "frombase64string", "|enc",
 ];
 
 fn has_drive_letter(s: &str) -> bool {
@@ -1051,7 +1060,8 @@ fn has_drive_letter(s: &str) -> bool {
 /// 危险命令判定（纯函数，供单测回归保护）。
 /// 返回命中的模式；课堂环境下删除 / 格式化 / 关机 / 远程代码执行类一律拒绝。
 pub fn is_blocked(command: &str) -> Option<&'static str> {
-    let lower = command.to_lowercase();
+    // .exe 归一化：reg.exe add / shutdown.exe 这类写法此前绕过黑名单
+    let lower = command.to_lowercase().replace(".exe", "");
     // format 特判：仅当指向盘符（format C:）才算格式化，
     // 避免 -Format 'yyyy-MM-dd' 这类参数误伤
     if lower.contains("format ") && has_drive_letter(&lower) {

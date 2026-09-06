@@ -456,32 +456,39 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 /* ---------- Tauri 命令 ---------- */
 
+/// busy 占位守卫：作用域结束（含提前 return / panic）自动释放，杜绝「占住不放」
+struct BusyGuard<'a>(&'a std::sync::atomic::AtomicBool);
+impl std::ops::Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 async fn agent_run(app: AppHandle, text: String) -> Result<(), String> {
     // 同步抢占：拒绝并发轮次（前端已拦一层，这里兜底）
-    if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let _ = app.emit(
-                "vcc://chat",
-                serde_json::json!({"role": "err", "text": "上一条指令还在执行中，请稍候"}),
-            );
-            return Ok(());
-        }
+    let state = app.try_state::<AppState>().ok_or("状态未就绪")?;
+    if state.busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let _ = app.emit(
+            "vcc://chat",
+            serde_json::json!({"role": "err", "text": "上一条指令还在执行中，请稍候"}),
+        );
+        return Ok(());
     }
-    tauri::async_runtime::spawn(async move {
-        let result = llm::run_agent(&app, text).await;
-        if let Err(e) = result {
-            let _ = app.emit("vcc://chat", serde_json::json!({"role": "err", "text": e}));
-            let _ = app.emit("vcc://phase", serde_json::json!({"phase": "idle"}));
-            let _ = app.emit(
-                "vcc://float",
-                serde_json::json!({"mode": "done", "steps": [], "text": "出错了，详情见主窗口"}),
-            );
-        }
-        if let Some(state) = app.try_state::<AppState>() {
-            state.busy.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
+    let _guard = BusyGuard(&state.busy);
+    // 直接 await（此前 spawn 后立即返回，invoke 几毫秒就 resolve，
+    // 前端 finally/agentBusy 门禁/会话刷新全部拿到错误时序）
+    let result = llm::run_agent(&app, text).await;
+    if let Err(e) = result {
+        let _ = app.emit("vcc://chat", serde_json::json!({"role": "err", "text": e}));
+        // 补发流结束信号：错误路径也复位前端 streamBubble / 完成绽放
+        let _ = app.emit("vcc://chat-end", serde_json::json!({}));
+        let _ = app.emit("vcc://phase", serde_json::json!({"phase": "idle"}));
+        let _ = app.emit(
+            "vcc://float",
+            serde_json::json!({"mode": "done", "steps": [], "text": "出错了，详情见主窗口"}),
+        );
+    }
     Ok(())
 }
 
@@ -512,9 +519,20 @@ fn save_config(app: AppHandle, config: config::Config) -> Result<(), String> {
 #[tauri::command]
 fn reset_history(app: AppHandle) -> Result<String, String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+        // CAS 占住 busy（只 load 检查存在竞态窗口：检查通过后 agent 可立刻插队 push 消息）
+        if state
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Err("上一条指令还在执行中".into());
         }
+        let _guard = BusyGuard(&state.busy);
         let hist = state.history.lock().map(|h| h.clone()).unwrap_or_default();
         // 当前会话精华后台并入长期记忆（异步，不阻塞 UI）
         if hist.iter().any(|m| m.role == "user") {
@@ -553,9 +571,19 @@ fn list_sessions(app: AppHandle) -> serde_json::Value {
 #[tauri::command]
 fn switch_session(app: AppHandle, id: String) -> Result<Vec<ChatMessage>, String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Err("上一条指令还在执行中，请稍候再切换".into());
         }
+        let _guard = BusyGuard(&state.busy);
         // 写回当前会话
         let cur = state.current.lock().map(|c| c.clone()).unwrap_or_default();
         if !cur.is_empty() && cur != id {
@@ -578,9 +606,19 @@ fn switch_session(app: AppHandle, id: String) -> Result<Vec<ChatMessage>, String
 #[tauri::command]
 fn delete_session(app: AppHandle, id: String) -> Result<String, String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Err("上一条指令还在执行中，请稍候再删除".into());
         }
+        let _guard = BusyGuard(&state.busy);
         let cur = state.current.lock().map(|c| c.clone()).unwrap_or_default();
         if cur == id {
             // 删当前：先清运行时历史再删，避免 save_history 复活它
@@ -608,20 +646,36 @@ fn delete_session(app: AppHandle, id: String) -> Result<String, String> {
     Err("状态未就绪".into())
 }
 
-/// 重命名会话
+/// 重命名会话（busy 时拒绝：rename 与 agent 收尾的 save_history 并发读改写 sessions.json 会丢更新）
 #[tauri::command]
 fn rename_session(app: AppHandle, id: String, title: String) -> Result<(), String> {
-    memory::rename_session(&app, &id, &title);
-    Ok(())
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("上一条指令还在执行中，请稍候再重命名".into());
+        }
+        memory::rename_session(&app, &id, &title);
+        return Ok(());
+    }
+    Err("状态未就绪".into())
 }
 
 /// 清空全部对话（保留长期记忆）
 #[tauri::command]
 fn clear_all_sessions(app: AppHandle) -> Result<String, String> {
     if let Some(state) = app.try_state::<AppState>() {
-        if state.busy.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return Err("上一条指令还在执行中".into());
         }
+        let _guard = BusyGuard(&state.busy);
         if let Ok(mut h) = state.history.lock() {
             h.clear();
         }
