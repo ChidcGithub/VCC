@@ -2,33 +2,24 @@
 /* sessions.json: 多会话存储（id/标题/时间/消息），对标 chat.deepseek.com 的会话列表
    memory.json:  AI 自动总结的长期记忆（用户偏好/设备环境/常用指令），注入 system prompt */
 
+use crate::config::data_dir;
 use crate::llm::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Manager};
 
 /* ---------- 路径 ---------- */
 
-fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|_| "无法定位数据目录".to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
+fn sessions_path() -> PathBuf {
+    data_dir().join("sessions.json")
 }
 
-fn sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("sessions.json"))
+fn legacy_history_path() -> PathBuf {
+    data_dir().join("history.json")
 }
 
-fn legacy_history_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("history.json"))
-}
-
-fn memory_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("memory.json"))
+fn memory_path() -> PathBuf {
+    data_dir().join("memory.json")
 }
 
 /* ---------- 多会话存储 ---------- */
@@ -70,27 +61,22 @@ fn gen_session_id() -> String {
 }
 
 /// 读取会话文件；首次运行时把旧版单文件 history.json 迁移成一个会话
-fn load_sessions_file(app: &AppHandle) -> SessionsFile {
-    if let Ok(path) = sessions_path(app) {
-        if let Ok(s) = fs::read_to_string(&path) {
-            match serde_json::from_str::<SessionsFile>(&s) {
-                Ok(f) => return f,
-                Err(_) => {
-                    // 损坏文件保留现场（.bad）供人工恢复，绝不用空文件覆盖
-                    let _ = fs::rename(&path, path.with_extension("json.bad"));
-                }
+fn load_sessions_file() -> SessionsFile {
+    let path = sessions_path();
+    if let Ok(s) = fs::read_to_string(&path) {
+        match serde_json::from_str::<SessionsFile>(&s) {
+            Ok(f) => return f,
+            Err(_) => {
+                // 损坏文件保留现场（.bad）供人工恢复，绝不用空文件覆盖
+                let _ = fs::rename(&path, path.with_extension("json.bad"));
             }
         }
     }
     // 迁移：旧 history.json → 单个会话（标题「历史对话」）
-    let legacy = if let Ok(p) = legacy_history_path(app) {
-        fs::read_to_string(p)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<ChatMessage>>(&s).ok())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let legacy = fs::read_to_string(legacy_history_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<ChatMessage>>(&s).ok())
+        .unwrap_or_default();
     let mut file = SessionsFile::default();
     if !legacy.is_empty() {
         let id = gen_session_id();
@@ -103,8 +89,8 @@ fn load_sessions_file(app: &AppHandle) -> SessionsFile {
             messages: legacy,
         });
     }
-    persist_sessions_file(app, &file);
-    let _ = fs::remove_file(legacy_history_path(app).unwrap_or_default()); // 迁移完成即清理
+    persist_sessions_file(&file);
+    let _ = fs::remove_file(legacy_history_path()); // 迁移完成即清理
     file
 }
 
@@ -121,17 +107,15 @@ fn atomic_write(path: &std::path::Path, data: &str) {
     }
 }
 
-fn persist_sessions_file(app: &AppHandle, file: &SessionsFile) {
-    if let Ok(path) = sessions_path(app) {
-        if let Ok(json) = serde_json::to_string_pretty(file) {
-            atomic_write(&path, &json);
-        }
+fn persist_sessions_file(file: &SessionsFile) {
+    if let Ok(json) = serde_json::to_string_pretty(file) {
+        atomic_write(&sessions_path(), &json);
     }
 }
 
 /// 把运行时历史写回当前会话（agent 轮次结束落盘 + 切换会话前保存）
-pub fn save_history(app: &AppHandle, hist: &[ChatMessage]) {
-    let mut file = load_sessions_file(app);
+pub fn save_history(hist: &[ChatMessage]) {
+    let mut file = load_sessions_file();
     if file.current_id.is_empty() {
         if hist.is_empty() {
             return;
@@ -161,14 +145,14 @@ pub fn save_history(app: &AppHandle, hist: &[ChatMessage]) {
             }
         }
     }
-    persist_sessions_file(app, &file);
+    persist_sessions_file(&file);
 }
 
 /// 启动恢复：返回当前会话的运行时历史
-pub fn load_history(app: &AppHandle) -> (String, Vec<ChatMessage>) {
-    let mut file = load_sessions_file(app);
+pub fn load_history() -> (String, Vec<ChatMessage>) {
+    let mut file = load_sessions_file();
     if file.sessions.is_empty() {
-        persist_sessions_file(app, &file);
+        persist_sessions_file(&file);
         return (String::new(), Vec::new());
     }
     if file.current_id.is_empty() || !file.sessions.iter().any(|s| s.id == file.current_id) {
@@ -179,7 +163,7 @@ pub fn load_history(app: &AppHandle) -> (String, Vec<ChatMessage>) {
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
         {
             file.current_id = latest.id.clone();
-            persist_sessions_file(app, &file);
+            persist_sessions_file(&file);
         }
     }
     let msgs = file
@@ -192,8 +176,8 @@ pub fn load_history(app: &AppHandle) -> (String, Vec<ChatMessage>) {
 }
 
 /// 会话列表（按更新时间倒序）
-pub fn list_sessions(app: &AppHandle) -> Vec<SessionMeta> {
-    let mut metas: Vec<SessionMeta> = load_sessions_file(app)
+pub fn list_sessions() -> Vec<SessionMeta> {
+    let mut metas: Vec<SessionMeta> = load_sessions_file()
         .sessions
         .into_iter()
         .map(|s| SessionMeta {
@@ -211,8 +195,8 @@ pub fn list_sessions(app: &AppHandle) -> Vec<SessionMeta> {
 }
 
 /// 新建会话并切换：返回新会话 id（调用方负责先把旧历史写回）
-pub fn new_session(app: &AppHandle) -> String {
-    let mut file = load_sessions_file(app);
+pub fn new_session() -> String {
+    let mut file = load_sessions_file();
     let id = gen_session_id();
     file.sessions.push(Session {
         id: id.clone(),
@@ -222,25 +206,25 @@ pub fn new_session(app: &AppHandle) -> String {
         messages: Vec::new(),
     });
     file.current_id = id.clone();
-    persist_sessions_file(app, &file);
+    persist_sessions_file(&file);
     id
 }
 
 /// 切换会话：返回该会话消息（调用方先写回旧会话）
-pub fn switch_session(app: &AppHandle, id: &str) -> Result<Vec<ChatMessage>, String> {
-    let mut file = load_sessions_file(app);
+pub fn switch_session(id: &str) -> Result<Vec<ChatMessage>, String> {
+    let mut file = load_sessions_file();
     let Some(s) = file.sessions.iter().find(|s| s.id == id) else {
         return Err("会话不存在".into());
     };
     let msgs = s.messages.clone();
     file.current_id = id.to_string();
-    persist_sessions_file(app, &file);
+    persist_sessions_file(&file);
     Ok(msgs)
 }
 
 /// 删除会话：若删的是当前会话则自动切到最近更新的；返回新的 current_id（可为空 = 无会话）
-pub fn delete_session(app: &AppHandle, id: &str) -> String {
-    let mut file = load_sessions_file(app);
+pub fn delete_session(id: &str) -> String {
+    let mut file = load_sessions_file();
     file.sessions.retain(|s| s.id != id);
     if file.current_id == id {
         file.current_id = file
@@ -250,23 +234,23 @@ pub fn delete_session(app: &AppHandle, id: &str) -> String {
             .map(|s| s.id.clone())
             .unwrap_or_default();
     }
-    persist_sessions_file(app, &file);
+    persist_sessions_file(&file);
     file.current_id
 }
 
 /// 重命名会话
-pub fn rename_session(app: &AppHandle, id: &str, title: &str) {
-    let mut file = load_sessions_file(app);
+pub fn rename_session(id: &str, title: &str) {
+    let mut file = load_sessions_file();
     if let Some(s) = file.sessions.iter_mut().find(|s| s.id == id) {
         let t = title.trim();
         s.title = if t.is_empty() { "新对话".into() } else { t.chars().take(40).collect() };
     }
-    persist_sessions_file(app, &file);
+    persist_sessions_file(&file);
 }
 
 /// 清空全部会话（设置里「清除所有对话」；记忆不受影响）
-pub fn clear_all_sessions(app: &AppHandle) {
-    persist_sessions_file(app, &SessionsFile::default());
+pub fn clear_all_sessions() {
+    persist_sessions_file(&SessionsFile::default());
 }
 
 /* ---------- AI 长期记忆 ---------- */
@@ -279,25 +263,21 @@ struct MemoryFile {
     updated_at: String,
 }
 
-pub fn load_memory(app: &AppHandle) -> String {
-    let Ok(path) = memory_path(app) else {
-        return String::new();
-    };
-    fs::read_to_string(path)
+pub fn load_memory() -> String {
+    fs::read_to_string(memory_path())
         .ok()
         .and_then(|s| serde_json::from_str::<MemoryFile>(&s).ok())
         .map(|m| m.summary)
         .unwrap_or_default()
 }
 
-pub fn save_memory(app: &AppHandle, summary: &str) {
-    let Ok(path) = memory_path(app) else { return };
+pub fn save_memory(summary: &str) {
     let file = MemoryFile {
         summary: summary.to_string(),
         updated_at: crate::llm::chrono_now_cn(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
-        atomic_write(&path, &json);
+        atomic_write(&memory_path(), &json);
     }
 }
 
@@ -350,27 +330,27 @@ fn render_transcript(msgs: &[ChatMessage]) -> String {
 static SUMMARIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 后台总结入口：永不 panic、失败静默——记忆是增强功能，绝不干扰主对话流程。
-pub async fn summarize_into_memory(app: AppHandle, msgs: Vec<ChatMessage>) {
+pub async fn summarize_into_memory(msgs: Vec<ChatMessage>) {
     // 单飞：总结耗时可达分钟级，并发触发时都读同一份旧记忆再整文件覆盖，
     // 后写者会抹掉先写者的成果——后到的直接跳过
     if SUMMARIZING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    let _ = summarize_inner(&app, &msgs).await; // 静默：网络故障/无 Key 时不弹错
+    let _ = summarize_inner(&msgs).await; // 静默：网络故障/无 Key 时不弹错
     SUMMARIZING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
-async fn summarize_inner(app: &AppHandle, msgs: &[ChatMessage]) -> Result<(), String> {
+async fn summarize_inner(msgs: &[ChatMessage]) -> Result<(), String> {
     // 没有用户实质发言就不总结（纯工具轮/空历史）
     if !msgs.iter().any(|m| m.role == "user") {
         return Ok(());
     }
-    let cfg = crate::config::load(app);
+    let cfg = crate::config::load();
     if cfg.api_key.is_empty() {
         return Ok(());
     }
 
-    let old = load_memory(app);
+    let old = load_memory();
     let transcript = render_transcript(msgs);
     if transcript.trim().is_empty() {
         return Ok(());
@@ -395,10 +375,6 @@ async fn summarize_inner(app: &AppHandle, msgs: &[ChatMessage]) -> Result<(), St
         return Ok(());
     }
 
-    save_memory(app, &summary);
-    let _ = app.emit(
-        "vcc://memory-updated",
-        serde_json::json!({ "summary": summary }),
-    );
+    save_memory(&summary);
     Ok(())
 }

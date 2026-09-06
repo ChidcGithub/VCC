@@ -681,16 +681,11 @@ mod task_dialog {
 }
 
 async fn show_dialog(v: &Value) -> ToolResult {
-    use tauri::Manager;
     let p = dialog_params(v)?;
-    // 父窗口：主窗可见时弹窗贴合其上（HWND 以 isize 跨线程传递）
-    let parent = crate::APP_HANDLE
-        .get()
-        .and_then(|app| app.get_webview_window("main"))
-        .filter(|w| w.is_visible().unwrap_or(false))
-        .and_then(|w| w.hwnd().ok())
-        .map(|h| h.0 as isize)
-        .unwrap_or(0);
+    // 父窗口：主窗可见时弹窗贴合其上（HWND 以 isize 跨线程传递，UI 线程注册到 WinCtl）
+    let ctl = crate::win_ctl();
+    let hwnd = ctl.hwnd();
+    let parent = if ctl.visible() && hwnd != 0 { hwnd } else { 0 };
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<i32, String>>();
     let (title, body, buttons) = (p.title.clone(), p.body.clone(), p.buttons.clone());

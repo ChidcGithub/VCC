@@ -10,7 +10,6 @@ use base64::Engine;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, Ordering};
-use tauri::Manager;
 use tokio::process::Command;
 
 /// 从 exe 目录逐级向上查找项目内的工具文件（dev 与打包布局都兼容）
@@ -116,20 +115,18 @@ struct ServerInfo {
     lang: String,
 }
 
-fn server_info_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let dir = app.path().app_config_dir().ok()?;
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("server.json"))
+fn server_info_path() -> Option<PathBuf> {
+    Some(crate::config::data_dir().join("server.json"))
 }
 
-fn read_server_info(app: &tauri::AppHandle) -> Option<ServerInfo> {
-    let p = server_info_path(app)?;
+fn read_server_info() -> Option<ServerInfo> {
+    let p = server_info_path()?;
     let s = std::fs::read_to_string(p).ok()?;
     serde_json::from_str(&s).ok()
 }
 
-fn write_server_info(app: &tauri::AppHandle, info: &ServerInfo) {
-    if let Some(p) = server_info_path(app) {
+fn write_server_info(info: &ServerInfo) {
+    if let Some(p) = server_info_path() {
         if let Ok(j) = serde_json::to_string(info) {
             let _ = std::fs::write(p, j);
         }
@@ -198,16 +195,14 @@ async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
     }
 
     // 2. 跨实例复用（server.json：可能是上次实例留下的健康孤儿）
-    if let Some(app) = crate::APP_HANDLE.get() {
-        if let Some(info) = read_server_info(app) {
-            if info.model == model_name && info.lang == lang && probe(info.port) {
-                SERVER_PORT.store(info.port, Ordering::Relaxed);
-                touch_server();
-                return Ok(info.port);
-            }
-            // 存在但不健康或档位不符 → 清理
-            kill_pid(info.pid);
+    if let Some(info) = read_server_info() {
+        if info.model == model_name && info.lang == lang && probe(info.port) {
+            SERVER_PORT.store(info.port, Ordering::Relaxed);
+            touch_server();
+            return Ok(info.port);
         }
+        // 存在但不健康或档位不符 → 清理
+        kill_pid(info.pid);
     }
 
     // 3. 启动新 server（模型以 cwd=models + 相对名传入，规避非 ASCII 路径崩溃）
@@ -230,11 +225,10 @@ async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
     common_args(cfg, &mut args);
 
     // stderr 落盘：server 崩溃不再静默，事后可查 whisper-server.log
-    let log_file = crate::APP_HANDLE.get().and_then(|app| {
-        let d = app.path().app_config_dir().ok()?;
-        let _ = std::fs::create_dir_all(&d);
-        std::fs::File::create(d.join("whisper-server.log")).ok()
-    });
+    let log_file = std::fs::File::create(
+        crate::config::data_dir().join("whisper-server.log"),
+    )
+    .ok();
 
     let mut cmd = Command::new(dir.join("whisper-server.exe"));
     cmd.args(&args)
@@ -259,19 +253,15 @@ async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
         if probe(port) {
             SERVER_PORT.store(port, Ordering::Relaxed);
             touch_server();
-            if let Some(app) = crate::APP_HANDLE.get() {
-                write_server_info(app, &ServerInfo { port, pid, model: model_name, lang });
-            }
+            write_server_info(&ServerInfo { port, pid, model: model_name, lang });
             return Ok(port);
         }
         if waiter.is_finished() {
-            let tail = crate::APP_HANDLE
-                .get()
-                .and_then(|app| {
-                    let p = app.path().app_config_dir().ok()?.join("whisper-server.log");
-                    std::fs::read_to_string(p).ok()
-                })
-                .map(|s| {
+            let tail = std::fs::read_to_string(
+                crate::config::data_dir().join("whisper-server.log"),
+            )
+            .ok()
+            .map(|s| {
                     let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
                     let start = lines.len().saturating_sub(4);
                     lines[start..].join(" | ")
@@ -292,22 +282,17 @@ async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
 fn stop_server() {
     let p = SERVER_PORT.swap(0, Ordering::Relaxed);
     let _ = p;
-    if let Some(app) = crate::APP_HANDLE.get() {
-        if let Some(info) = read_server_info(app) {
-            kill_pid(info.pid);
-            if let Some(path) = server_info_path(app) {
-                let _ = std::fs::remove_file(path);
-            }
+    if let Some(info) = read_server_info() {
+        kill_pid(info.pid);
+        if let Some(path) = server_info_path() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
 /// 预热：应用启动后后台静默拉起常驻 server（用户首次说话即热态，无冷启动等待）
 pub async fn warmup() {
-    let cfg = match crate::APP_HANDLE.get() {
-        Some(app) => crate::config::load(app),
-        None => return,
-    };
+    let cfg = crate::config::load();
     let _ = ensure_server(&cfg).await;
 }
 
@@ -456,12 +441,7 @@ pub async fn transcribe(wav_base64: &str) -> Result<String, String> {
     ));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
 
-    let cfg = {
-        match crate::APP_HANDLE.get() {
-            Some(app) => crate::config::load(app),
-            None => crate::config::Config::default(),
-        }
-    };
+    let cfg = crate::config::load();
 
     let result = transcribe_inner(&cfg, &tmp).await;
     let _ = std::fs::remove_file(&tmp);
@@ -501,8 +481,7 @@ fn finalize_text(t: String) -> Result<String, String> {
 
 
 
-/// 预热检查 + 基准（供诊断：invoke('probe_env')）
-#[tauri::command]
+/// 预热检查 + 基准（诊断用）
 pub fn probe_env() -> Result<String, String> {
     let cli = whisper_dir().ok_or("tools/whisper/Release/ 未找到")?;
     let fast = resolve_model("fast").map(|p| p.display().to_string()).unwrap_or_default();

@@ -1,27 +1,35 @@
 [package]
 name = "voice-control-for-class"
-version = "0.5.0"
+version = "0.6.0-egui.1"
 description = "LLM-powered voice agent for classroom PC control"
 edition = "2021"
 
 [lib]
 name = "vcc_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+crate-type = ["rlib"]
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-global-shortcut = "2"
-tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
 enigo = "0.2"
 base64 = "0.22"
+# egui 原生 UI（主窗对话界面）
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+# WebView2 承载（跑马灯 overlay + 悬浮窗，HTML 零改动复用）
+wry = "0.56.1"
+http = "1"
+raw-window-handle = "0.6"
+# 托盘 + 全局热键（Tauri 生态同源库，可独立使用）
+tray-icon = "0.24.2"
+global-hotkey = "0.8.0"
+# 麦克风采集 + WAV 编码
+cpal = "0.18.2"
+# 托盘图标解码
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+egui = "0.36.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -36,7 +44,9 @@ windows = { version = "0.61", features = [
   "Win32_System_Ole",
   "Win32_UI_Accessibility",
   "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
 ] }
 
 [profile.release]
@@ -44,9 +54,3 @@ opt-level = "s"
 lto = true
 strip = true
 codegen-units = 1
-
-# Local patch: transparent windows use WS_EX_NOREDIRECTIONBITMAP instead of
-# legacy DWM blur-behind glass (which renders as a grey frosted ring on Win11).
-# See scripts/patch-tao.py for the two-line change.
-[patch.crates-io]
-tao = { path = "../vendor/tao-0.35.3" }

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -27,10 +26,10 @@ pub struct Config {
     /// 自定义快捷指令（空态胶囊按钮，最多 8 条；空 = 用默认四条）
     #[serde(default)]
     pub custom_cmds: Vec<String>,
-    /// 朗读 AI 回答（投影课堂：学生听得到回答）
+    /// 朗读 AI 回答（投影课堂：学生听得到回答）——egui 分支暂缓 TTS，字段保留兼容旧配置
     #[serde(default)]
     pub tts_enabled: bool,
-    /// 界面主题：dark / light（body class 切换，对齐 chat.deepseek.com 机制）
+    /// 界面主题：dark / light
     #[serde(default = "default_theme")]
     pub theme: String,
 }
@@ -73,35 +72,41 @@ impl Default for Config {
     }
 }
 
-fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|_| "无法定位配置目录".to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join("config.json"))
+/// 数据目录：与 Tauri 版完全一致（%APPDATA%\com.chidc.vcc）——
+/// config.json / sessions.json / memory.json / server.json / whisper-server.log 零迁移
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var("APPDATA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("com.chidc.vcc");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn config_path() -> PathBuf {
+    data_dir().join("config.json")
 }
 
 /// 读取配置；解析失败时把坏文件改名 .bad 保留现场再回落默认
 /// （否则下次 save 用默认配置覆盖，API Key 被静默抹掉）
-pub fn load(app: &AppHandle) -> Config {
-    let parsed = config_path(app).ok().and_then(|p| {
-        fs::read_to_string(&p)
-            .ok()
-            .map(|s| (p, serde_json::from_str::<Config>(&s).ok()))
-    });
-    match parsed {
-        Some((_, Some(cfg))) => cfg,
-        Some((p, None)) => {
-            let _ = fs::rename(&p, p.with_extension("json.bad"));
-            Config::default()
-        }
-        None => Config::default(),
+pub fn load() -> Config {
+    let path = config_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<Config>(&s) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                let _ = fs::rename(&path, path.with_extension("json.bad"));
+                Config::default()
+            }
+        },
+        Err(_) => Config::default(),
     }
 }
 
-pub fn save(app: &AppHandle, cfg: &Config) -> Result<(), String> {
-    let path = config_path(app)?;
+pub fn save(cfg: &Config) -> Result<(), String> {
+    let path = config_path();
     let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     // 原子写：临时文件 + rename 替换（进程中途被杀不留半截 JSON，
     // 半截 JSON 会让下次 load 回落默认配置、API Key 被静默抹掉）

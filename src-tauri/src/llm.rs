@@ -1,7 +1,8 @@
-use crate::{config::Config, tools};
+use crate::bus::{EventTx, Step, UiEvent};
+use crate::config::Config;
+use crate::tools;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
 
 /* ---------- DeepSeek / OpenAI 兼容消息结构 ---------- */
 
@@ -207,7 +208,7 @@ pub fn chrono_now_cn() -> String {
 async fn chat_completion_stream(
     cfg: &Config,
     messages: &[ChatMessage],
-    app: &AppHandle,
+    ev: &EventTx,
 ) -> Result<ChatMessage, String> {
     use futures_util::StreamExt;
 
@@ -287,12 +288,12 @@ async fn chat_completion_stream(
                     if !c.is_empty() {
                         if !streaming {
                             streaming = true;
-                            let _ = app.emit("vcc://chat-start", json!({}));
+                            ev.send(UiEvent::ChatStart);
                         }
                         content_acc.push_str(c);
                         delta_buf.push_str(c);
                         if last_flush.elapsed() >= std::time::Duration::from_millis(33) {
-                            let _ = app.emit("vcc://chat-delta", json!({"text": delta_buf}));
+                            ev.send(UiEvent::ChatDelta(delta_buf.clone()));
                             delta_buf = String::new();
                             last_flush = std::time::Instant::now();
                         }
@@ -324,7 +325,7 @@ async fn chat_completion_stream(
 
     // 冲刷剩余 delta（流尾不足 33ms 的尾巴）
     if !delta_buf.is_empty() {
-        let _ = app.emit("vcc://chat-delta", json!({"text": delta_buf}));
+        ev.send(UiEvent::ChatDelta(delta_buf.clone()));
     }
     // chat-end 不在这里发：流函数每轮调用，每轮都发会让前端把中间工具轮
     // 误判为回答结束（phase 闪 done→idle 抖动）；最终轮由 run_agent 统一发，
@@ -393,12 +394,11 @@ pub async fn chat_completion_simple(cfg: &Config, messages: &[ChatMessage]) -> R
 
 /* ---------- Agent 主循环 ---------- */
 
-pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
-    let cfg = crate::config::load(app);
-    let memory = crate::memory::load_memory(app);
+pub async fn run_agent(state: &crate::VccState, ev: &EventTx, text: String) -> Result<(), String> {
+    let cfg = crate::config::load();
+    let memory = crate::memory::load_memory();
 
     let history = {
-        let state = app.state::<crate::AppState>();
         let mut hist = state.history.lock().map_err(|_| "历史锁错误")?;
         hist.push(ChatMessage::text("user", &text));
         if hist.len() > 60 {
@@ -411,22 +411,21 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
                 hist.remove(0);
             }
             if !dropped.is_empty() {
-                let app2 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    crate::memory::summarize_into_memory(app2, dropped).await;
+                tokio::spawn(async move {
+                    crate::memory::summarize_into_memory(dropped).await;
                 });
             }
         }
         hist.clone()
     };
 
-    let _ = app.emit("vcc://phase", json!({"phase": "thinking"}));
+    ev.send(UiEvent::Phase("thinking".into()));
 
     let mut messages: Vec<ChatMessage> =
         vec![ChatMessage::text("system", &build_system_prompt(&memory))];
     messages.extend(history);
 
-    let mut steps: Vec<Value> = Vec::new();
+    let mut steps: Vec<Step> = Vec::new();
     let mut rounds = 0;
 
     // 主体包进 async block：失败路径统一走回滚（重试不产生重复 user 轮次）
@@ -437,18 +436,18 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
             return Err("这个任务步骤太多了，试试拆成两步告诉我".into());
         }
 
-        let msg = chat_completion_stream(&cfg, &messages, app).await?;
+        let msg = chat_completion_stream(&cfg, &messages, ev).await?;
 
         if let Some(tcs) = &msg.tool_calls {
             if !tcs.is_empty() {
                 messages.push(msg.clone());
                 for tc in tcs {
                     let label = tool_label(&tc.function.name, &serde_json::from_str::<Value>(&tc.function.arguments).unwrap_or_else(|_| json!({})));
-                    steps.push(json!({"label": label, "status": "running"}));
+                    steps.push(Step { label, status: "running".into() });
 
-                    let _ = app.emit("vcc://phase", json!({"phase": "executing"}));
-                    let _ = app.emit("vcc://tool", json!({"id": tc.id, "label": label}));
-                    let _ = app.emit("vcc://float", json!({"mode": "show", "steps": steps, "state": "执行中"}));
+                    ev.send(UiEvent::Phase("executing".into()));
+                    ev.send(UiEvent::ToolStart { id: tc.id.clone(), label: steps.last().unwrap().label.clone() });
+                    ev.send(UiEvent::Float { mode: "show".into(), steps: steps.clone(), text: String::new() });
 
                     let result = tools::execute(&tc.function.name, &tc.function.arguments).await;
                     let ok = result.is_ok();
@@ -461,9 +460,9 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
                         content
                     };
 
-                    steps.last_mut().unwrap()["status"] = json!(if ok { "done" } else { "fail" });
-                    let _ = app.emit("vcc://tool-done", json!({"id": tc.id, "ok": ok}));
-                    let _ = app.emit("vcc://float", json!({"mode": "show", "steps": steps, "state": "执行中"}));
+                    steps.last_mut().unwrap().status = if ok { "done" } else { "fail" }.into();
+                    ev.send(UiEvent::ToolDone { id: tc.id.clone(), ok });
+                    ev.send(UiEvent::Float { mode: "show".into(), steps: steps.clone(), text: String::new() });
 
                     messages.push(ChatMessage {
                         role: "tool".into(),
@@ -479,21 +478,20 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
         // 最终回答（内容已通过流式事件渲染到前端）
         let answer = msg.content.unwrap_or_else(|| "（已完成）".into());
         {
-            let state = app.state::<crate::AppState>();
             let mut hist = state.history.lock().map_err(|_| "历史锁错误")?;
             hist.push(ChatMessage::text("assistant", &answer));
             // 落盘：重启后恢复对话流
-            crate::memory::save_history(app, &hist);
+            crate::memory::save_history(&hist);
         }
         // 纯工具调用无文本输出时，主窗口补一个完成气泡
         if answer.trim().is_empty() || answer == "（已完成）" {
-            let _ = app.emit("vcc://chat", json!({"role": "ai", "text": "✓ 已执行完成"}));
+            ev.send(UiEvent::ChatBubble { role: "ai", text: "✓ 已执行完成".into() });
         }
         // 最终流结束信号：仅整次回答结束发一次（前端渲染 markdown + TTS + 完成绽放）
-        let _ = app.emit("vcc://chat-end", json!({}));
-        let _ = app.emit("vcc://float", json!({"mode": "done", "steps": steps, "text": answer}));
+        ev.send(UiEvent::ChatEnd);
+        ev.send(UiEvent::Float { mode: "done".into(), steps: steps.clone(), text: answer.clone() });
         // done（而非直接 idle）：主窗完成绽放 + 跑马灯淡出；900ms 后由前端统一回落 idle
-        let _ = app.emit("vcc://phase", json!({"phase": "done"}));
+        ev.send(UiEvent::Phase("done".into()));
         return Ok(());
     }
     }.await;
@@ -501,16 +499,14 @@ pub async fn run_agent(app: &AppHandle, text: String) -> Result<(), String> {
     if result.is_err() {
         // 回滚：把本次 push 的 user 消息弹出并落盘（API 失败/流中断不留残轮，
         // 且防止重试后历史里出现两条相同指令）
-        if let Some(state) = app.try_state::<crate::AppState>() {
-            if let Ok(mut hist) = state.history.lock() {
-                let is_ours = hist
-                    .last()
-                    .map(|m| m.role == "user" && m.content.as_deref() == Some(text.as_str()))
-                    .unwrap_or(false);
-                if is_ours {
-                    hist.pop();
-                    crate::memory::save_history(app, &hist);
-                }
+        if let Ok(mut hist) = state.history.lock() {
+            let is_ours = hist
+                .last()
+                .map(|m| m.role == "user" && m.content.as_deref() == Some(text.as_str()))
+                .unwrap_or(false);
+            if is_ours {
+                hist.pop();
+                crate::memory::save_history(&hist);
             }
         }
     }

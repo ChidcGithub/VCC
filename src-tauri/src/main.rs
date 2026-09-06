@@ -79,7 +79,7 @@ mod vcc_tests {
         }
         let tmp = std::env::temp_dir().join("vcc_test_cli_reg.wav");
         std::fs::copy(&src, &tmp).unwrap();
-        let t = tauri::async_runtime::block_on(infer_via_cli(&cfg, &tmp));
+        let t = vcc_lib::block_on(infer_via_cli(&cfg, &tmp));
         let _ = std::fs::remove_file(&tmp);
         let t = t.expect("whisper CLI 推理应成功");
         assert!(!t.trim().is_empty(), "whisper CLI 应返回非空文本");
@@ -133,7 +133,7 @@ mod vcc_tests {
     /// OCR 全屏冒烟：真实跑一遍 PowerShell + WinRT 识别（桌面有字，应出文本）
     #[test]
     fn ocr_screen_smoke() {
-        match tauri::async_runtime::block_on(ocr_screen("")) {
+        match vcc_lib::block_on(ocr_screen("")) {
             Ok(s) => assert!(!s.is_empty()),
             Err(e) => {
                 // 无语言包环境允许跳过
@@ -231,5 +231,23 @@ mod vcc_tests {
             out.status.success() || so.contains("__NO_OCR__"),
             "OCR 脚本失败（stderr 见上）"
         );
+    }
+
+    /* ---------- 会话存储（多会话 roundtrip） ---------- */
+
+    /// 列表 → 新建 → 切换 → 重命名 → 删除 全链路（走真实 %APPDATA% 数据目录）
+    #[test]
+    fn sessions_lifecycle() {
+        use vcc_lib::memory;
+        let before = memory::list_sessions();
+        let _ = before; // 只验证可读
+        let id = memory::new_session();
+        memory::rename_session(&id, "测试会话甲");
+        let list = memory::list_sessions();
+        let found = list.iter().find(|s| s.id == id).expect("新会话应在列表");
+        assert_eq!(found.title, "测试会话甲");
+        memory::delete_session(&id);
+        let after = memory::list_sessions();
+        assert!(!after.iter().any(|s| s.id == id), "删除后不应在列表");
     }
 }
