@@ -26,11 +26,11 @@ function render(payload) {
   if (payload.mode === 'show' || payload.mode === 'done') {
     stepsEl.innerHTML = '';
     const steps = payload.steps || [];
-    // SF Symbols 风格步骤图标（SVG）
+    // M3 步骤图标（Material Symbols Rounded，与主窗工具行同套）
     const ICONS = {
-      running: '<svg class="s-spin" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2.2" stroke-dasharray="27" stroke-dashoffset="9" stroke-linecap="round"/></svg>',
-      done: '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="currentColor" opacity="0.14"/><path d="M4.8 8.2l2.2 2.2 4.2-4.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-      fail: '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="currentColor" opacity="0.14"/><path d="M5.4 5.4l5.2 5.2M10.6 5.4l-5.2 5.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+      running: '<span class="msr">progress_activity</span>',
+      done: '<span class="msr">check</span>',
+      fail: '<span class="msr">cancel</span>',
     };
     for (const s of steps) {
       const div = document.createElement('div');

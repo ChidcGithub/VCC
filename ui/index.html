@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VCC</title>
+  <link rel="stylesheet" href="icons.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body class="dark idle">
@@ -16,16 +17,12 @@
           <span class="brand-name">VCC</span>
         </div>
         <button class="icon-btn" id="btn-collapse" title="收起侧栏">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="4" width="18" height="16" rx="3"/><line x1="9.5" y1="4" x2="9.5" y2="20"/>
-          </svg>
+          <span class="msr ico-17">left_panel_close</span>
         </button>
       </div>
 
       <button class="new-chat" id="btn-new">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <path d="M12 5v14M5 12h14"/>
-        </svg>
+        <span class="msr ico-16">edit_square</span>
         <span>开启新对话</span>
       </button>
 
@@ -33,16 +30,11 @@
 
       <div class="sb-foot">
         <button class="foot-item" id="btn-theme" title="切换深浅主题">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/>
-          </svg>
+          <span class="msr ico-16" id="theme-ico">light_mode</span>
           <span id="theme-label">浅色模式</span>
         </button>
         <button class="foot-item" id="btn-settings">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/>
-          </svg>
+          <span class="msr ico-16">settings</span>
           <span>设置</span>
         </button>
       </div>
@@ -54,9 +46,7 @@
     <main class="main">
       <header class="topbar" data-tauri-drag-region>
         <button class="icon-btn expand-btn" id="btn-expand" title="展开侧栏">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/>
-          </svg>
+          <span class="msr ico-17">menu</span>
         </button>
         <div class="topbar-title" id="topbar-title" data-tauri-drag-region>VCC</div>
         <div class="hint" data-tauri-drag-region>Ctrl+Shift+Space 呼出 · Esc 隐藏</div>
@@ -66,9 +56,7 @@
         <div class="chat-col" id="chat" aria-live="polite">
           <div id="empty-state" class="empty-state hidden">
             <div class="es-logo">
-              <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13 2 4.9 12.5a.6.6 0 0 0 .47.97H11l-1 8.53L18.9 11.5a.6.6 0 0 0-.47-.97H13z"/>
-              </svg>
+              <span class="msr es-logo-ico">bolt</span>
             </div>
             <div class="es-title">你好，我是 VCC</div>
             <div class="es-sub">随时开始吧 —— 语音或文字，一句话操控这台电脑</div>
@@ -91,18 +79,11 @@
             autocomplete="off" spellcheck="false"></textarea>
           <div class="input-tools">
             <button class="tool-btn" id="btn-mic" title="按住说话">
-              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <rect x="9" y="3" width="6" height="11" rx="3"/>
-                <path d="M5 11a7 7 0 0 0 14 0"/>
-                <line x1="12" y1="18" x2="12" y2="21"/>
-              </svg>
+              <span class="msr ico-17">mic</span>
             </button>
             <span class="input-hint">Enter 发送 · Shift+Enter 换行</span>
             <button class="tool-btn send" id="btn-send" title="发送">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 19V5"/>
-                <path d="M5 12l7-7 7 7"/>
-              </svg>
+              <span class="msr ico-16">arrow_upward</span>
             </button>
           </div>
         </div>
@@ -114,15 +95,11 @@
   <!-- 会话右键/⋯ 菜单 -->
   <div id="session-menu" class="session-menu hidden">
     <button class="menu-item" id="menu-rename">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/>
-      </svg>
+      <span class="msr ico-14">edit</span>
       重命名
     </button>
     <button class="menu-item danger" id="menu-delete">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
-      </svg>
+      <span class="msr ico-14">delete</span>
       删除
     </button>
   </div>
@@ -131,7 +108,9 @@
   <div id="settings" class="settings hidden">
     <div class="settings-head">
       <span>设置</span>
-      <button class="icon-btn" id="btn-close-settings">✕</button>
+      <button class="icon-btn" id="btn-close-settings" title="关闭">
+        <span class="msr ico-17">close</span>
+      </button>
     </div>
     <div class="group-title first">外观</div>
     <label>主题

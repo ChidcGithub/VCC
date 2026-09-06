@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### M3 图标体系
+
+- **全量替换字符/手绘图标为 Material Symbols Rounded（M3 官方图标）**：工具行执行/完成/失败（progress_activity 旋转 / check / cancel）、会话更多（more_horiz）、重命名/删除菜单（edit / delete）、新对话（edit_square）、主题（light_mode/dark_mode 随主题联动）、设置（settings）、侧栏折叠/展开（left_panel_close / menu）、麦克风（mic）、发送（arrow_upward）、空态闪电 logo（bolt，FILL 填充）、设置关闭（close）、悬浮窗步骤图标与主窗同套
+- **本地字体子集**：Google Fonts CSS2 API 按需子集（17 图标 ≈ 24KB woff2）随应用打包，运行时零外网依赖；新增 `ui/icons.css`（@font-face + .msr 基类），主窗与悬浮窗共用
+- 消息文案去除装饰性 emoji（欢迎语 ⚡）；保存/清记忆状态改用 M3 check 图标
+
 ### 对话窗口大改（对标 chat.deepseek.com）
 
 - **全新布局**：左侧会话侧栏 + 居中消息流 + 底部胶囊输入条。布局规格实测自官方页面 CSS（侧栏 261px / 消息流 max 840px / 输入条圆角 24px / 会话项高 40px·圆角 12px / 新对话胶囊按钮圆角 100px），保留 VCC 的呼出弹入、工具执行行、悬浮识别字幕等自有组件

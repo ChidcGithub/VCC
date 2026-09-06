@@ -834,3 +834,17 @@ body.summon .app {
   from { opacity: 0.82; transform: scale(0.988) translateY(5px); }
   to { opacity: 1; transform: none; }
 }
+
+/* ---------- M3 图标（Material Symbols Rounded）细节 ---------- */
+.es-logo-ico {
+  font-size: 30px;
+  font-variation-settings: "FILL" 1, "wght" 500, "GRAD" 0, "opsz" 48;
+}
+.s-more .msr { font-size: 15px; }
+.tool-line .t-ico { font-size: 14px; }
+#settings-status .msr {
+  font-size: 13px;
+  vertical-align: -2px;
+  margin-right: 3px;
+  color: var(--ok);
+}

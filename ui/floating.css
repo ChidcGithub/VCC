@@ -106,10 +106,10 @@ html, body {
   width: 17px; height: 17px;
   display: grid; place-items: center;
 }
-.f-step .s-ico svg { width: 15px; height: 15px; display: block; }
+.f-step .s-ico .msr { font-size: 15px; display: block; }
 .f-step.running { color: rgba(0, 0, 0, 0.82); }
 .f-step.running .s-ico { color: rgba(0, 0, 0, 0.85); }
-.f-step.running .s-spin { animation: f-spin 0.85s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+.f-step.running .s-ico .msr { animation: f-spin 0.85s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
 .f-step.done .s-ico { color: rgba(0, 0, 0, 0.88); }
 .f-step.fail { color: rgba(0, 0, 0, 0.35); }
 .f-step.fail .s-ico { color: rgba(0, 0, 0, 0.35); }

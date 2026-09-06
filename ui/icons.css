@@ -1,0 +1,36 @@
+/* ============================================================
+   M3 图标：Material Symbols Rounded（本地子集）
+   子集由 Google Fonts CSS2 API icon_names 按需生成（17 图标 ≈ 24KB），
+   随应用打包，运行时零外网依赖。新增图标时需重新生成子集：
+   family=Material+Symbols+Rounded&icon_names=a,b,c&display=block
+   ============================================================ */
+
+@font-face {
+  font-family: "Material Symbols Rounded";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block; /* 加载完成前不渲染 ligature 原文（避免闪字） */
+  src: url("fonts/msr.woff2") format("woff2");
+}
+
+.msr {
+  font-family: "Material Symbols Rounded";
+  font-weight: normal;
+  font-style: normal;
+  display: inline-block;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  overflow: hidden;
+  user-select: none;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 常用尺寸（对齐原 SVG 图标尺寸） */
+.ico-18 { font-size: 18px; }
+.ico-17 { font-size: 17px; }
+.ico-16 { font-size: 16px; }
+.ico-15 { font-size: 15px; }
+.ico-14 { font-size: 14px; }

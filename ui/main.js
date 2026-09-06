@@ -169,7 +169,7 @@ function addDivider(text) {
 function addToolLine(label) {
   const div = document.createElement('div');
   div.className = 'tool-line running';
-  div.innerHTML = '<span class="t-ico">◔</span><span class="t-label"></span><span class="t-ms"></span>';
+  div.innerHTML = '<span class="msr t-ico">progress_activity</span><span class="t-label"></span><span class="t-ms"></span>';
   div.querySelector('.t-label').textContent = label;
   div.title = nowHM();
   chatEl.appendChild(div);
@@ -181,7 +181,7 @@ function finishToolLine(el, ok, ms) {
   if (!el) return;
   el.classList.remove('running');
   el.classList.add(ok ? 'done' : 'fail');
-  el.querySelector('.t-ico').textContent = ok ? '✓' : '✕';
+  el.querySelector('.t-ico').textContent = ok ? 'check' : 'cancel';
   if (ms != null) {
     let m = el.querySelector('.t-ms');
     if (m) m.textContent = ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms) + 'ms';
@@ -661,7 +661,7 @@ function buildSessionItem(s) {
 
   const more = document.createElement('button');
   more.className = 's-more';
-  more.textContent = '⋯';
+  more.innerHTML = '<span class="msr">more_horiz</span>';
   more.title = '更多操作';
   more.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -814,6 +814,9 @@ function applyTheme(t) {
   document.body.classList.toggle('light', !dark);
   const label = document.getElementById('theme-label');
   if (label) label.textContent = dark ? '浅色模式' : '深色模式';
+  // 图标与标签同步指向「点击后进入的模式」（深色时显示太阳，浅色时显示月亮）
+  const ico = document.getElementById('theme-ico');
+  if (ico) ico.textContent = dark ? 'light_mode' : 'dark_mode';
 }
 
 document.getElementById('btn-theme').addEventListener('click', async () => {
@@ -934,7 +937,7 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     // 保存即生效（不等重启）
     await invoke('set_autostart', { on: autostart });
     invoke('set_always_on_top', { on: topmost });
-    status.textContent = '✓ 已保存';
+    status.innerHTML = '<span class="msr">check</span>已保存';
     // 快捷指令即时生效（空态有胶囊时重建）
     currentCmds = document.getElementById('cfg-cmds').value.split('\n')
       .map((s) => s.trim()).filter(Boolean).slice(0, 8);
@@ -961,7 +964,7 @@ document.getElementById('btn-clear-memory').addEventListener('click', async () =
   document.getElementById('cfg-memory').value = '';
   try { await invoke('save_memory_cmd', { summary: '' }); } catch (_) {}
   const status = document.getElementById('settings-status');
-  status.textContent = '✓ 记忆已清除';
+  status.innerHTML = '<span class="msr">check</span>记忆已清除';
   setTimeout(() => { status.textContent = ''; }, 1500);
 });
 
@@ -989,7 +992,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // 无 Key 引导（放在 renderHistory 之后，避免被清空；出现引导时隐藏空态）
   if (!cfg.api_key && !demo) {
     if (esTemplate && esTemplate.isConnected) esTemplate.remove();
-    addBubble('ai', '你好，我是 VCC ⚡\n首次使用请先点侧栏底部「设置」填入 DeepSeek API Key。\n\n可以用语音或文字让我：调音量/亮度、点鼠标、开文件、跑命令…');
+    addBubble('ai', '你好，我是 VCC\n首次使用请先点侧栏底部「设置」填入 DeepSeek API Key。\n\n可以用语音或文字让我：调音量/亮度、点鼠标、开文件、跑命令…');
   }
   ttsOn = !!cfg.tts_enabled;
   setPhase('idle');
