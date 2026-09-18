@@ -10,16 +10,18 @@
       background: transparent;
       overflow: hidden;
     }
+    /* 小布 Next 长按波形条带：底部全宽 × 160px（≈手机 52dp 视图 @2.75x）
+       显隐透明度由着色器内 COE 动画轨驱动（FadeIn 624ms / FadeOut 464ms），
+       CSS 只负责 COUI 面板 Fragment 的底部生长滑入（350ms emphasized-decel） */
     #gl {
-      position: fixed; inset: 0;
-      width: 100vw; height: 100vh;
+      position: fixed; left: 0; bottom: 0;
+      width: 100vw; height: 160px;
       display: block;
-      opacity: 0;
-      transform: scale(1.015);
-      transition: opacity 0.75s cubic-bezier(0.32, 0.72, 0, 1),
-                  transform 1.15s cubic-bezier(0.32, 0.72, 0, 1);
+      transform: translateY(14px);
+      transition: transform 0.35s cubic-bezier(0.05, 0.7, 0.1, 1);
+      will-change: transform;
     }
-    #gl.on { opacity: 1; transform: scale(1); }
+    #gl.on { transform: translateY(0); }
   </style>
 </head>
 <body>
