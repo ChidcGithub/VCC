@@ -10,13 +10,20 @@
      层3 噪声波（freq15/speed2/羽化 0.09）；颜色各取色环 1/3 段错开滚动 */
 
 const canvas = document.getElementById('gl');
-const gl = canvas.getContext('webgl2', {
-  alpha: true, premultipliedAlpha: true,
-  antialias: false, depth: false, stencil: false,
-});
+const CTX_OPTS = { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false };
+const FORCE_GL1 = /[?&]gl1/.test(location.search);   // 无头验证回退路径用
+let gl = FORCE_GL1 ? null : canvas.getContext('webgl2', CTX_OPTS);
+let gl1 = false;   // WebGL1 回退：真机 WebView2 分层透明窗口下 webgl2 可能创建失败（旧版 fbm 即 webgl1）
 if (!gl) {
-  console.error('[vcc-wave] WebGL2 unavailable, marquee disabled');
+  gl = canvas.getContext('webgl', CTX_OPTS) || canvas.getContext('experimental-webgl', CTX_OPTS);
+  gl1 = !!gl;
+}
+if (!gl) {
+  document.body.classList.add('no-webgl');   // CSS 兜底呼吸条：保证课堂场景可见反馈
+  if (typeof dbg === 'function') dbg('WebGL unavailable, CSS fallback');
+  console.error('[vcc-wave] WebGL unavailable, CSS fallback');
 } else {
+  if (typeof dbg === 'function' && /[?&]debug/.test(location.search)) dbg('context: ' + (gl1 ? 'webgl1 (fallback)' : 'webgl2'));
 
 const VERT = `#version 300 es
 in vec2 a_position;
@@ -346,23 +353,57 @@ void main() {
 `;
 /* ======== 原文结束 ======== */
 
+/* WebGL1（ES 100）降级版：仅当 webgl2 上下文创建失败时使用，由 ES 300 原文机械转换 */
+function toES100Vert(s) {
+  return s.replace('#version 300 es', '')
+          .replace('in vec2 a_position;', 'attribute vec2 a_position;')
+          .replace('out vec2 v_texCoord;', 'varying vec2 v_texCoord;');
+}
+function toES100Frag(s) {
+  return s.replace('#version 300 es', '')
+          .replace('in vec2 v_texCoord;', 'varying vec2 v_texCoord;')
+          .replace('out vec4 fragColor;', '')
+          .replace('fragColor = color;', 'gl_FragColor = color;')
+          .replace(/texture[(]/g, 'texture2D(');
+}
+const VERT_ES100 = toES100Vert(VERT);
+const FRAG_ES100 = toES100Frag(FRAG);
+
+/* 诊断：错误既进 console 也（在 ?debug=1 下）画到 DOM——无头截图与现场排障共用 */
+function dbg(msg) {
+  console.error('[vcc-wave]', msg);
+  if (!/[?&]debug/.test(location.search)) return;
+  let pre = document.getElementById('vcc-dbg');
+  if (!pre) {
+    pre = document.createElement('pre');
+    pre.id = 'vcc-dbg';
+    pre.style.cssText = 'position:fixed;top:0;left:0;z-index:9;color:#fff;background:rgba(130,0,0,.88);font:11px/1.45 Consolas,monospace;margin:0;padding:6px 10px;max-width:100vw;max-height:70vh;overflow:hidden;white-space:pre-wrap';
+    document.body.appendChild(pre);
+  }
+  pre.textContent += msg + '\n';
+}
 function sh(type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
   gl.compileShader(s);
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    console.error('[vcc-wave]', gl.getShaderInfoLog(s));
+    dbg('shader compile failed:\n' + gl.getShaderInfoLog(s));
   }
   return s;
 }
 const prog = gl.createProgram();
-gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
-gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, gl1 ? VERT_ES100 : VERT));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, gl1 ? FRAG_ES100 : FRAG));
 gl.linkProgram(prog);
 if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-  console.error('[vcc-wave] link:', gl.getProgramInfoLog(prog));
+  dbg('program link failed:\n' + gl.getProgramInfoLog(prog));
 }
 gl.useProgram(prog);
+if (/[?&]debug/.test(location.search)) {
+  const ext = gl.getExtension('WEBGL_debug_renderer_info');
+  dbg('WebGL2 renderer: ' + (ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+}
+if (/[?&]probe/.test(location.search)) window.__probeOn = true;
 
 /* 全屏三角（a_position 语义同原 vs：直通裁剪空间） */
 const buf = gl.createBuffer();
@@ -409,6 +450,7 @@ gl.uniform2f(U.u_blackPos, 0.1, 0.8);
 /* ======== LUT 纹理（COE 包原版 PNG） ======== */
 /* colorTex wrapMode=10497(GL_REPEAT) 色环无缝滚动；noise wrapMode=33648(GL_MIRRORED_REPEAT) */
 function loadLut(b64, wrap, unit) {
+  if (gl1) wrap = gl.CLAMP_TO_EDGE;   // WebGL1 NPOT 限制：色环 UV 由 fract 预包裹，CLAMP 无视觉损失
   const t = gl.createTexture();
   gl.activeTexture(unit);
   gl.bindTexture(gl.TEXTURE_2D, t);
@@ -419,6 +461,7 @@ function loadLut(b64, wrap, unit) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
   const img = new Image();
   img.onload = () => {
+    window.__lut = (window.__lut || 0) + 1;   // 探针：LUT 已上传数
     gl.activeTexture(unit);   // 异步上传回各自单元，避免覆盖对方绑定
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
@@ -481,16 +524,17 @@ const LVL_BASE = [0.15, 0.301, 0.15];          // COE FadeOut/FadeIn 声浪基�
 const BORDER_ON = [1, 0.3, 0.6, 0.5];          // COE 边框呼吸终值（w=0.5 混流光）
 
 /* 每通道独立补间，支持中断续值（从当前显示值出发，COUI 中断规则） */
-function chan() { return { v: 0, from: 0, to: 0, t: 1, dur: 1 }; }
+function chan() { return { v: 0, from: 0, to: 0, t: 1, dur: 1, t0: 0 }; }
 const chAlpha = chan();
 const chBase = [chan(), chan(), chan()];
 const chBorder = [chan(), chan(), chan(), chan()];
 function seek(ch, target, dur) {
-  ch.from = ch.v; ch.to = target; ch.t = 0; ch.dur = Math.max(dur, 1e-4);
+  ch.from = ch.v; ch.to = target; ch.t = 0; ch.dur = Math.max(dur, 1e-4); ch.t0 = performance.now();
 }
-function tick(ch, dt) {
+/* 绝对时间推进：rAF 被节流（窗口隐藏/遮挡）时也能走到正确进度，显隐绝不卡在透明态 */
+function tick(ch, nowMs) {
   if (ch.t >= 1) return;
-  ch.t = Math.min(1, ch.t + dt / ch.dur);
+  ch.t = Math.min(1, (nowMs - ch.t0) / (ch.dur * 1000));
   ch.v = ch.from + (ch.to - ch.from) * bezEval(EASE[0], EASE[1], EASE[2], EASE[3], ch.t);
 }
 
@@ -525,19 +569,22 @@ function proceduralLevel(t) {
   return Math.min(0.9, Math.max(0.05, v));
 }
 
-function frame(now) {
-  const dt = Math.min((now - last) / 1000, 0.1);
-  last = now;
-  tAcc += dt;
-  tick(chAlpha, dt);
-  for (const c of chBase) tick(c, dt);
-  for (const c of chBorder) tick(c, dt);
-
-  /* 语音电平包络：快攻慢放（经典音频表头手法） */
-  const k = lvlTarget > lvl ? 1 - Math.exp(-dt * 22) : 1 - Math.exp(-dt * 4.5);
-  lvl += (lvlTarget - lvl) * k;
-
-  /* 三层声浪 = COE 动画基线 + 实时电平（层级灵敏度差制造厚度） */
+let frameNo = 0;
+function probeDump() {
+  const cx = Math.floor(canvas.width / 2);
+  const px = new Uint8Array(4);
+  const hits = [];
+  let maxA = 0;
+  for (let y = 0; y < canvas.height; y++) {
+    gl.readPixels(cx, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    if (px[3] > 2) { hits.push(y + ':' + px.join(',')); if (px[3] > maxA) maxA = px[3]; }
+  }
+  dbg('PROBE phase=' + phase + ' tAcc=' + tAcc.toFixed(2) +
+      ' alpha=' + chAlpha.v.toFixed(3) + ' border0=' + chBorder[0].v.toFixed(3) +
+      ' lvl=' + lvl.toFixed(3) + ' lut=' + (window.__lut || 0) +
+      ' maxA=' + maxA + ' hits[' + hits.length + ']=' + hits.slice(0, 10).join(' | '));
+}
+function drawFrame() {
   let live = 0;
   if (phase === 'listening') live = lvl;
   else if (phase === 'executing') live = proceduralLevel(tAcc);
@@ -553,6 +600,23 @@ function frame(now) {
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  tAcc += dt;
+  tick(chAlpha, now);
+  for (const c of chBase) tick(c, now);
+  for (const c of chBorder) tick(c, now);
+
+  /* 语音电平包络：快攻慢放（经典音频表头手法） */
+  const k = lvlTarget > lvl ? 1 - Math.exp(-dt * 22) : 1 - Math.exp(-dt * 4.5);
+  lvl += (lvlTarget - lvl) * k;
+
+  drawFrame();
+  frameNo++;
+  if (window.__probeOn && frameNo === 20) probeDump();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -571,5 +635,15 @@ if (qp.get('bg') === 'dark') document.body.style.background = '#101014'; // 截�
 const lv0 = parseFloat(qp.get('level') || '0');
 if (lv0 > 0) lvlTarget = Math.min(1, lv0); // 截图演示语音响应用
 setPhase(qp.get('phase') || qp.get('demo') || 'idle');
+if (qp.has('fast')) {   // 跳过渐变直接到终值（无头截图/渲染验证）
+  chAlpha.v = chAlpha.to;
+  for (const c of chBase) c.v = c.to;
+  for (const c of chBorder) c.v = c.to;
+}
+if (qp.has('still')) {  // 单帧取证：固定 tAcc 画一帧 + 立即读回像素
+  tAcc = 5.0;
+  drawFrame();
+  if (window.__probeOn) probeDump();
+}
 
 }

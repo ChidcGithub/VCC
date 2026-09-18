@@ -22,6 +22,19 @@
       will-change: transform;
     }
     #gl.on { transform: translateY(0); }
+    /* WebGL 完全不可用时的兜底呼吸条（正常不出现；保证课堂场景必有反馈） */
+    body.no-webgl #gl { display: none; }
+    body.no-webgl::after {
+      content: ''; position: fixed; left: 6vw; right: 6vw; bottom: 18px; height: 84px;
+      border-radius: 28px;
+      background: linear-gradient(90deg, rgba(64,150,238,.55), rgba(88,200,140,.5), rgba(196,120,220,.5), rgba(240,150,80,.55));
+      filter: blur(14px);
+      animation: vccbreath 1.27s cubic-bezier(0.33, 0, 0.67, 1) infinite;
+    }
+    @keyframes vccbreath {
+      0%, 100% { opacity: .22; transform: translateY(12px) scaleX(.985); }
+      50% { opacity: .5; transform: translateY(0) scaleX(1); }
+    }
   </style>
 </head>
 <body>

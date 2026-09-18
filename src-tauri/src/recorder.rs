@@ -1,7 +1,9 @@
-/* ---------- 麦克风采集：cpal 输入流 → i16 累积 → WAV(hound) → base64 ---------- */
-/* 替代原 HTML 前端的 getUserMedia+WAV 编码；电平表供跑马灯呼吸强度。 */
+/* ---------- 麦克风采集：cpal 输入流 → i16 累积 → 下混单声道+重采样 16k → WAV → base64 ---------- */
+/* whisper 契约：16kHz / 单声道 / 16bit PCM WAV（voice.rs validate_wav 强校验）。
+   设备原始格式（常见 48k 立体声）在 stop 时统一转换，采集回调保持零转换低开销。 */
 
 use base64::Engine;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Recorder {
@@ -28,6 +30,23 @@ pub fn start() -> Result<Recorder, String> {
         rate as usize * channels as usize * 30,
     )));
 
+    // WASAPI 偶发 "A buffer underrun or overrun occurred" 属瞬时抖动（Chrome 同样忽略）；
+    // 其余错误只报第一次，避免刷屏
+    let quiet = Arc::new(AtomicBool::new(false));
+    // 闭包工厂：I16/F32 两个分支各 clone 一份（Arc 非 Copy）
+    let err_cb = || {
+        let quiet = quiet.clone();
+        move |e: cpal::Error| {
+            let s = e.to_string();
+            if s.contains("underrun") || s.contains("overrun") {
+                return; // WASAPI 瞬时缓冲抖动，流仍正常，忽略
+            }
+            if !quiet.swap(true, Ordering::Relaxed) {
+                eprintln!("vcc: mic err {s}");
+            }
+        }
+    };
+
     let sink = samples.clone();
     let fmt = cfg.sample_format();
     let stream_cfg: cpal::StreamConfig = cfg.into();
@@ -39,7 +58,7 @@ pub fn start() -> Result<Recorder, String> {
                     s.extend_from_slice(d);
                 }
             },
-            |e| eprintln!("vcc: mic err {e}"),
+            err_cb(),
             None,
         ),
         cpal::SampleFormat::F32 => device.build_input_stream(
@@ -49,7 +68,7 @@ pub fn start() -> Result<Recorder, String> {
                     s.extend(d.iter().map(|x| (x.clamp(-1.0, 1.0) * 32767.0) as i16));
                 }
             },
-            |e| eprintln!("vcc: mic err {e}"),
+            err_cb(),
             None,
         ),
         f => return Err(format!("不支持的麦克风采样格式 {f:?}")),
@@ -93,7 +112,7 @@ impl Recorder {
     }
 
     /// 停止录音并编码 WAV base64（消耗 self：Stream drop 停流）。
-    /// WAV 头手写（PCM 16bit）——hound 3.5 的 WavWriter 没有 into_inner，取不出字节。
+    /// 输出恒为 16kHz/单声道/16bit——whisper 契约，与设备原始格式无关。
     pub fn stop(self) -> Result<String, String> {
         let samples = match self.samples.lock() {
             Ok(s) => s.clone(),
@@ -102,9 +121,49 @@ impl Recorder {
         if samples.len() < self.sample_rate as usize / 5 {
             return Err("录音太短".into());
         }
-        let bytes = wav_bytes(&samples, self.sample_rate, self.channels);
+        let bytes = encode_16k_mono_wav(&samples, self.sample_rate, self.channels);
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
+}
+
+/// 下混单声道 + 线性插值重采样到 16kHz + 44 字节头 PCM WAV（16bit LE）。
+/// pub 供测试：头字段（声道=1 / 率=16000）必须严格满足 whisper 校验。
+pub fn encode_16k_mono_wav(samples: &[i16], src_rate: u32, channels: u16) -> Vec<u8> {
+    let ch = channels.max(1) as usize;
+    let frames = samples.len() / ch;
+    if frames == 0 {
+        return wav_bytes(&[], 16000, 1);
+    }
+    // 1) 交错帧 → 单声道（平均下混）
+    let mono: Vec<f32> = (0..frames)
+        .map(|f| {
+            let mut acc = 0f64;
+            for c in 0..ch {
+                acc += samples[f * ch + c] as f64 / 32768.0;
+            }
+            (acc / ch as f64) as f32
+        })
+        .collect();
+    // 2) 线性插值重采样 src_rate → 16000（语音转写足够；whisper 内部还会再走重采样窗）
+    let out: Vec<i16> = if src_rate == 16000 {
+        mono.iter()
+            .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect()
+    } else {
+        let out_frames = (frames as u64 * 16000) / src_rate as u64;
+        let step = f64::from(src_rate) / 16000.0;
+        (0..out_frames)
+            .map(|i| {
+                let pos = i as f64 * step;
+                let i0 = (pos as usize).min(frames - 1);
+                let i1 = (i0 + 1).min(frames - 1);
+                let fr = (pos - i0 as f64) as f32;
+                let v = mono[i0] * (1.0 - fr) + mono[i1] * fr;
+                (v.clamp(-1.0, 1.0) * 32767.0) as i16
+            })
+            .collect()
+    };
+    wav_bytes(&out, 16000, 1)
 }
 
 /// 标准 PCM WAV（44 字节头 + LE i16 数据）

@@ -325,4 +325,30 @@ mod vcc_tests {
         assert_eq!(s.a(), 127);
         assert_eq!(scrim(egui::Color32::BLACK, 2.0).a(), 255, "alpha 应钳制");
     }
+
+    /// 录音输出契约：48k 立体声 → 16k 单声道 16bit WAV（whisper 硬校验）
+    #[test]
+    fn recorder_encodes_16k_mono_wav() {
+        let frames = 4800; // 0.1s @48kHz
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = ((i as f32 / 48000.0) * 440.0 * 2.0 * std::f32::consts::PI).sin();
+            let s = (v * 16000.0) as i16;
+            samples.push(s);
+            samples.push(s); // 立体声同相
+        }
+        let bytes = vcc_lib::recorder::encode_16k_mono_wav(&samples, 48000, 2);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 1, "声道必须为 1");
+        assert_eq!(
+            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            16000,
+            "采样率必须为 16000"
+        );
+        assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 16, "位深必须为 16");
+        let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        let out_frames = data_len / 2;
+        assert!((out_frames as i64 - 1600).abs() <= 1, "4800 帧@48k → 1600 帧@16k，得到 {out_frames}");
+    }
 }
