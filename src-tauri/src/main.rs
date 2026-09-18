@@ -241,13 +241,88 @@ mod vcc_tests {
         use vcc_lib::memory;
         let before = memory::list_sessions();
         let _ = before; // 只验证可读
-        let id = memory::new_session();
-        memory::rename_session(&id, "测试会话甲");
+        let id = memory::new_session().expect("new_session");
+        memory::rename_session(&id, "测试会话甲").expect("rename_session");
         let list = memory::list_sessions();
         let found = list.iter().find(|s| s.id == id).expect("新会话应在列表");
         assert_eq!(found.title, "测试会话甲");
-        memory::delete_session(&id);
+        memory::delete_session(&id).expect("delete_session");
         let after = memory::list_sessions();
         assert!(!after.iter().any(|s| s.id == id), "删除后不应在列表");
+    }
+
+    /* ---------- 小布 Next 动效（motion.rs） ---------- */
+
+    /// COUI/M3 曲线：端点归一 + 单调性（Newton-Raphson 求值正确性）
+    #[test]
+    fn motion_curves_endpoints_and_monotonic() {
+        use vcc_lib::motion::{curve, CubicBezier};
+        let curves: [(&str, CubicBezier); 6] = [
+            ("coui_ease", curve::COUI_EASE),
+            ("coui_ease_in", curve::COUI_EASE_IN),
+            ("coui_ease_out", curve::COUI_EASE_OUT),
+            ("task_slide", curve::COUI_TASK_SLIDE),
+            ("m3_emph_dec", curve::M3_EMPH_DECELERATE),
+            ("m3_emph_acc", curve::M3_EMPH_ACCELERATE),
+        ];
+        for (name, c) in curves {
+            assert!(c.eval(0.0).abs() < 1e-4, "{name} eval(0) != 0");
+            assert!((c.eval(1.0) - 1.0).abs() < 1e-4, "{name} eval(1) != 1");
+            assert!(c.eval(-0.5) == 0.0 && c.eval(1.5) == 1.0, "{name} 越界未钳制");
+            let mut prev = -1.0;
+            for i in 0..=20 {
+                let y = c.eval(i as f32 / 20.0);
+                assert!(y >= prev - 1e-4, "{name} 曲线在 {i}/20 处回退: {y} < {prev}");
+                prev = y;
+            }
+        }
+    }
+
+    /// M3 emphasized path（两段贝塞尔）：端点、拼接连续、中段陡升特征、单调
+    #[test]
+    fn motion_m3_emphasized_path() {
+        use vcc_lib::motion::m3_emphasized;
+        assert_eq!(m3_emphasized(-0.1), 0.0);
+        assert_eq!(m3_emphasized(1.1), 1.0);
+        let a = m3_emphasized(0.166);
+        let b = m3_emphasized(0.167);
+        assert!((a - b).abs() < 0.05, "emphasized 两段拼接不连续: {a} vs {b}");
+        assert!(m3_emphasized(0.25) > 0.7, "emphasized 中段应陡升");
+        let mut prev = -1.0;
+        for i in 0..=20 {
+            let y = m3_emphasized(i as f32 / 20.0);
+            assert!(y >= prev - 1e-3, "emphasized 在 {i}/20 处回退");
+            prev = y;
+        }
+    }
+
+    /// Anim 生命周期：进度钳制、done 判定、retarget 从当前值起步
+    #[test]
+    fn motion_anim_lifecycle_and_retarget() {
+        use std::time::Duration;
+        use vcc_lib::motion::{curve, Anim};
+        let mut a = Anim::new(200, curve::COUI_EASE, 0.0, 10.0);
+        assert!(!a.done());
+        assert!(a.value() < 1.0, "起步值应接近 from");
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(a.done());
+        assert!((a.value() - 10.0).abs() < 1e-3, "完成后应到达 to");
+        a.retarget(0.0, 200);
+        assert!((a.from - 10.0).abs() < 1e-3, "retarget 应从当前值起步（COUI 中断规则）");
+        assert!((a.to - 0.0).abs() < 1e-6);
+    }
+
+    /// Android accelerate-decelerate 端点 + 颜色工具
+    #[test]
+    fn motion_android_acc_dec_and_colors() {
+        use vcc_lib::motion::{android_acc_dec, lerp_color, scrim};
+        assert!(android_acc_dec(0.0).abs() < 1e-6);
+        assert!((android_acc_dec(1.0) - 1.0).abs() < 1e-6);
+        assert!((android_acc_dec(0.5) - 0.5).abs() < 1e-6);
+        let mid = lerp_color(egui::Color32::BLACK, egui::Color32::WHITE, 0.5);
+        assert_eq!(mid.r(), 128);
+        let s = scrim(egui::Color32::BLACK, 0.5);
+        assert_eq!(s.a(), 127);
+        assert_eq!(scrim(egui::Color32::BLACK, 2.0).a(), 255, "alpha 应钳制");
     }
 }

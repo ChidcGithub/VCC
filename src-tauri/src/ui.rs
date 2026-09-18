@@ -4,10 +4,12 @@
    主题：深浅双套色板（对标 chat.deepseek.com 观感），品牌蓝 #4D6BFE。 */
 
 use crate::bus::{EventTx, PumpMsg, SharedWinCtl, UiEvent};
+use crate::motion::{self, Anim};
 use crate::recorder::Recorder;
 use crate::SharedState;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
 /* ---------- 主题 ---------- */
 
@@ -101,6 +103,14 @@ pub struct VccApp {
     hwnd_done: bool,
     hwnd: isize,
     always_on_top: bool,
+
+    /* ---- 小布 Next 动效状态 ---- */
+    boot: Instant,                       // 全局时钟（spinner 相位 / 光标呼吸）
+    intro: Option<Anim>,                 // 主窗口入场（面板 Fragment 350ms）
+    fade_out: Option<Anim>,              // 主窗口退场（150ms，完成后 SW_HIDE）
+    settings_anim: Option<(bool, Anim)>, // 设置浮层 (opening, anim)
+    entering: Vec<(usize, Instant)>,     // 气泡入场（index + 时间）
+    last_visible: bool,                  // 可见性沿检测
 }
 
 impl VccApp {
@@ -145,7 +155,62 @@ impl VccApp {
             hwnd_done: false,
             hwnd: 0,
             always_on_top,
+            boot: Instant::now(),
+            intro: None,
+            fade_out: None,
+            settings_anim: None,
+            entering: Vec::new(),
+            last_visible: true,
         }
+    }
+
+    /* ---------- 动效动作 ---------- */
+
+    /// 新消息统一入口：记录入场时间戳，气泡做「从底部生长淡入」
+    fn push_msg(&mut self, m: UiMsg) {
+        self.msgs.push(m);
+        if self.cfg.reduce_motion {
+            return;
+        }
+        let idx = self.msgs.len() - 1;
+        self.entering.push((idx, Instant::now()));
+        if self.entering.len() > 8 {
+            self.entering.remove(0);
+        }
+    }
+
+    fn open_settings(&mut self) {
+        if self.show_settings {
+            return;
+        }
+        self.show_settings = true;
+        if self.cfg.reduce_motion {
+            return;
+        }
+        self.settings_anim = Some((
+            true,
+            Anim::new(motion::DIALOG_IN_MS, motion::curve::M3_EMPH_DECELERATE, 0.0, 1.0),
+        ));
+    }
+
+    fn close_settings(&mut self) {
+        if !self.show_settings {
+            return;
+        }
+        // 已在关闭动画中则不重复
+        if let Some((opening, _)) = &self.settings_anim {
+            if !*opening {
+                return;
+            }
+        }
+        if self.cfg.reduce_motion {
+            self.show_settings = false;
+            return;
+        }
+        self.settings_anim = Some((
+            false,
+            Anim::new(motion::DIALOG_OUT_MS, motion::curve::M3_EMPH_ACCELERATE, 0.0, 1.0),
+        ));
     }
 
     /* ---------- 事件处理 ---------- */
@@ -164,19 +229,19 @@ impl VccApp {
                 UiEvent::ChatEnd => {
                     if let Some(s) = self.stream_text.take() {
                         if !s.trim().is_empty() {
-                            self.msgs.push(UiMsg::Ai(s));
+                            self.push_msg(UiMsg::Ai(s));
                         }
                     }
                 }
                 UiEvent::ChatBubble { role, text } => {
                     if role == "err" {
-                        self.msgs.push(UiMsg::Err(text));
+                        self.push_msg(UiMsg::Err(text));
                     } else {
-                        self.msgs.push(UiMsg::Ai(text));
+                        self.push_msg(UiMsg::Ai(text));
                     }
                 }
                 UiEvent::ToolStart { id, label } => {
-                    self.msgs.push(UiMsg::Tool { id, label, done: None });
+                    self.push_msg(UiMsg::Tool { id, label, done: None });
                 }
                 UiEvent::ToolDone { id, ok } => {
                     if let Some(m) = self.msgs.iter_mut().rev().find(|m| match m {
@@ -215,14 +280,14 @@ impl VccApp {
             Ok(text) => {
                 let t = text.trim().to_string();
                 if t.is_empty() {
-                    self.msgs.push(UiMsg::Err("没听清，再试一次？".into()));
+                    self.push_msg(UiMsg::Err("没听清，再试一次？".into()));
                     self.set_phase("idle");
                 } else {
                     self.send(t);
                 }
             }
             Err(e) => {
-                self.msgs.push(UiMsg::Err(e));
+                self.push_msg(UiMsg::Err(e));
                 self.set_phase("idle");
             }
         }
@@ -250,7 +315,7 @@ impl VccApp {
                 .push(UiMsg::Err("上一条指令还在执行中，请稍候".into()));
             return;
         }
-        self.msgs.push(UiMsg::User(text.clone()));
+        self.push_msg(UiMsg::User(text.clone()));
         let st = self.state.clone();
         let ev = self.ev.clone();
         crate::rt().spawn(async move {
@@ -282,6 +347,7 @@ impl VccApp {
     fn reload_display(&mut self) {
         self.msgs = msgs_from_history(&self.state);
         self.stream_text = None;
+        self.entering.clear();
     }
 
     fn new_chat(&mut self) {
@@ -302,13 +368,21 @@ impl VccApp {
         if let Ok(mut h) = self.state.history.lock() {
             h.clear();
         }
-        let id = crate::memory::new_session();
+        let id = match crate::memory::new_session() {
+            Ok(id) => id,
+            Err(e) => {
+                self.push_msg(UiMsg::Err(e));
+                self.refresh_sessions();
+                return;
+            }
+        };
         if let Ok(mut c) = self.state.current.lock() {
             *c = id.clone();
         }
         self.current_sid = id;
         self.msgs.clear();
         self.stream_text = None;
+        self.entering.clear();
         self.refresh_sessions();
     }
 
@@ -335,7 +409,7 @@ impl VccApp {
                 .lock()
                 .map(|h| h.clone())
                 .unwrap_or_default();
-            crate::memory::save_history(&hist);
+            let _ = crate::memory::save_history(&hist);
         }
         match crate::memory::switch_session(id) {
             Ok(msgs) => {
@@ -348,7 +422,7 @@ impl VccApp {
                 self.current_sid = id.to_string();
                 self.reload_display();
             }
-            Err(e) => self.msgs.push(UiMsg::Err(e)),
+            Err(e) => self.push_msg(UiMsg::Err(e)),
         }
         self.refresh_sessions();
     }
@@ -370,11 +444,16 @@ impl VccApp {
                 h.clear();
             }
         }
-        let new_cur = crate::memory::delete_session(id);
-        let final_id = if new_cur.is_empty() {
-            crate::memory::new_session()
-        } else {
-            new_cur
+        let final_id = match crate::memory::delete_session(id) {
+            Ok(next) if !next.is_empty() => next,
+            _ => match crate::memory::new_session() {
+                Ok(n) => n,
+                Err(e) => {
+                    self.push_msg(UiMsg::Err(e));
+                    self.refresh_sessions();
+                    return;
+                }
+            },
         };
         if cur == id {
             let msgs = crate::memory::switch_session(&final_id).unwrap_or_default();
@@ -394,7 +473,9 @@ impl VccApp {
         if let Some(id) = self.renaming.take() {
             let t = self.rename_buf.trim().to_string();
             if !t.is_empty() {
-                crate::memory::rename_session(&id, &t);
+                if let Err(e) = crate::memory::rename_session(&id, &t) {
+                    self.push_msg(UiMsg::Err(e));
+                }
             }
         }
         self.rename_buf.clear();
@@ -417,7 +498,7 @@ impl VccApp {
                     });
                 }
                 Err(e) => {
-                    self.msgs.push(UiMsg::Err(e));
+                    self.push_msg(UiMsg::Err(e));
                     self.set_phase("idle");
                 }
             }
@@ -427,7 +508,7 @@ impl VccApp {
                     self.recorder = Some(rec);
                     self.set_phase("listening");
                 }
-                Err(e) => self.msgs.push(UiMsg::Err(e)),
+                Err(e) => self.push_msg(UiMsg::Err(e)),
             }
         }
     }
@@ -518,7 +599,11 @@ impl VccApp {
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
                 if ui.button(egui::RichText::new("⚙ 设置").color(th.weak)).clicked() {
-                    self.show_settings = !self.show_settings;
+                    if self.show_settings {
+                        self.close_settings();
+                    } else {
+                        self.open_settings();
+                    }
                 }
                 let theme_label = if self.dark { "☀ 浅色" } else { "🌙 深色" };
                 if ui.button(egui::RichText::new(theme_label).color(th.weak)).clicked() {
@@ -535,12 +620,30 @@ impl VccApp {
 
     fn message_view(&mut self, ui: &mut egui::Ui) {
         let th = theme(self.dark);
+        let boot = self.boot; // Instant: Copy
+        let now = Instant::now();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(self.stream_text.is_some())
             .show(ui, |ui| {
                 let width = ui.available_width();
-                for m in &self.msgs {
+                for (idx, m) in self.msgs.iter().enumerate() {
+                    // COUI 气泡入场：从底部生长淡入（位移 220ms，TASK_SLIDE 轻回弹）
+                    let dy = self
+                        .entering
+                        .iter()
+                        .find(|(i, t)| {
+                            *i == idx && now.duration_since(*t).as_millis() < motion::BUBBLE_MS as u128
+                        })
+                        .map(|(_, t)| {
+                            let pr = now.duration_since(*t).as_secs_f32()
+                                / (motion::BUBBLE_MS as f32 / 1000.0);
+                            10.0 * (1.0 - motion::curve::COUI_TASK_SLIDE.eval(pr.min(1.0)))
+                        })
+                        .unwrap_or(0.0);
+                    if dy > 0.5 {
+                        ui.add_space(dy);
+                    }
                     match m {
                         UiMsg::User(t) => {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -578,7 +681,19 @@ impl VccApp {
                                 ui.add_space(10.0);
                                 match done {
                                     None => {
-                                        ui.add(egui::Spinner::new().size(12.0).color(th.accent));
+                                        // COUI loading：1.27s/圈 3/4 圆弧手绘 spinner
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        motion::draw_spinner(
+                                            ui.painter(),
+                                            rect.center(),
+                                            6.0,
+                                            2.2,
+                                            th.accent,
+                                            boot.elapsed().as_secs_f32(),
+                                        );
                                         ui.label(egui::RichText::new(label).color(th.weak).size(12.5));
                                     }
                                     Some(true) => {
@@ -595,22 +710,46 @@ impl VccApp {
                         }
                     }
                 }
-                // 流式气泡
+                // 流式气泡（光标呼吸：1s 周期 COUI 淡入淡出曲线）
+                let breath = 0.5
+                    - 0.5 * (boot.elapsed().as_secs_f32() * std::f32::consts::TAU
+                        / motion::CURSOR_BREATH_S)
+                        .cos();
+                let cursor_color = if self.cfg.reduce_motion {
+                    th.accent
+                } else {
+                    motion::scrim(th.accent, 0.35 + 0.65 * breath)
+                };
                 if let Some(s) = &self.stream_text {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.set_max_width(width * 0.86);
                             if s.is_empty() {
-                                ui.label(egui::RichText::new("…").color(th.weak));
+                                // COUI spinner 代替省略号
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                motion::draw_spinner(
+                                    ui.painter(),
+                                    rect.center(),
+                                    6.0,
+                                    2.2,
+                                    th.accent,
+                                    boot.elapsed().as_secs_f32(),
+                                );
                             } else {
                                 crate::md::show(ui, s, &th.md());
-                                ui.label(egui::RichText::new("▌").color(th.accent).size(13.0));
+                                ui.label(egui::RichText::new("▌").color(cursor_color).size(13.0));
                             }
                         });
                     });
                 }
             });
+        // 入场完成的气泡索引清理（闭包外，避免闭包 mut 捕获）
+        self.entering
+            .retain(|(_, t)| now.duration_since(*t).as_millis() < (motion::BUBBLE_MS as u128) + 50);
     }
 
     fn input_bar(&mut self, ui: &mut egui::Ui) {
@@ -666,12 +805,19 @@ impl VccApp {
                 let text = std::mem::take(&mut self.input);
                 self.send(text);
             }
-            // 发送按钮
+            // 发送按钮（enable 颜色过渡：150ms M3_STANDARD）
             let can_send = !self.input.trim().is_empty();
-            let send_btn = egui::Button::new(
-                egui::RichText::new("发送").color(if can_send { egui::Color32::WHITE } else { th.weak }),
-            )
-            .fill(if can_send { th.accent } else { th.input_bg })
+            let t_ready = ui.ctx().animate_value_with_time(
+                egui::Id::new("send_ready"),
+                if can_send { 1.0 } else { 0.0 },
+                motion::INTERACT_MS as f32 / 1000.0,
+            );
+            let send_btn = egui::Button::new(egui::RichText::new("发送").color(motion::lerp_color(
+                th.weak,
+                egui::Color32::WHITE,
+                t_ready,
+            )))
+            .fill(motion::lerp_color(th.input_bg, th.accent, t_ready))
             .corner_radius(100.0)
             .min_size(egui::vec2(64.0, 30.0));
             if ui.add(send_btn).clicked() && can_send {
@@ -708,6 +854,24 @@ impl VccApp {
 
     fn settings_ui(&mut self, ctx: &egui::Context) {
         let th = theme(self.dark);
+        // ---- COUI 居中对话框：scrim 遮罩 + scale 0.8→1（250ms 进 / 150ms 出） ----
+        let (p, opening) = match &self.settings_anim {
+            Some((opening, a)) => (a.progress(), *opening),
+            None => (1.0, true),
+        };
+        let scrim_a = if opening { 0.35 * p } else { 0.35 * (1.0 - p) };
+        egui::Area::new(egui::Id::new("settings_scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(ctx.viewport_rect().min)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    ctx.viewport_rect(),
+                    0.0,
+                    motion::scrim(egui::Color32::BLACK, scrim_a),
+                );
+            });
+        let scale = if opening { 0.8 + 0.2 * p } else { 1.0 - 0.04 * p };
         egui::Window::new(egui::RichText::new("设置").size(16.0))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .resizable(false)
@@ -766,9 +930,15 @@ impl VccApp {
                         crate::set_always_on_top_impl(self.hwnd, self.cfg.always_on_top);
                     }
                 });
+                if ui
+                    .checkbox(&mut self.cfg.reduce_motion, "减少动态效果")
+                    .changed()
+                {
+                    let _ = crate::config::save(&self.cfg);
+                }
                 if ui.checkbox(&mut self.cfg.autostart, "开机自启").changed() {
                     if let Err(e) = crate::set_autostart_impl(self.cfg.autostart) {
-                        self.msgs.push(UiMsg::Err(e));
+                        self.push_msg(UiMsg::Err(e));
                         self.cfg.autostart = !self.cfg.autostart;
                     }
                 }
@@ -793,17 +963,29 @@ impl VccApp {
                     {
                         self.cfg.theme = if self.dark { "dark".into() } else { "light".into() };
                         match crate::config::save(&self.cfg) {
-                            Ok(()) => self.show_settings = false,
-                            Err(e) => self.msgs.push(UiMsg::Err(e)),
+                            Ok(()) => self.close_settings(),
+                            Err(e) => self.push_msg(UiMsg::Err(e)),
                         }
                     }
                     if ui.button("取消").clicked() {
                         // 回读放弃改动（置顶等已即时生效项保留）
                         self.cfg = crate::config::load();
-                        self.show_settings = false;
+                        self.close_settings();
                     }
                 });
+            })
+            .map(|r| {
+                // scale 动画：围绕窗口中心缩放（渲染 + 命中测试同变换）
+                let c = r.response.rect.center();
+                ctx.set_transform_layer(
+                    r.response.layer_id,
+                    egui::emath::TSTransform {
+                        scaling: scale,
+                        translation: c.to_vec2() - scale * c.to_vec2(),
+                    },
+                );
             });
+        motion::repaint_tick(ctx); // 对话框动画/呼吸驱动
     }
 
     fn detect_hwnd(&mut self) {
@@ -848,6 +1030,19 @@ impl eframe::App for VccApp {
             }
         }
 
+        // 可见性沿：false→true（热键/托盘唤起）触发 COUI 面板入场（350ms）
+        let vis = self.ctl.main_visible.load(Ordering::SeqCst);
+        if vis && !self.last_visible && !self.cfg.reduce_motion {
+            self.intro = Some(Anim::new(
+                motion::PANEL_IN_MS,
+                motion::curve::COUI_EASE_IN,
+                0.0,
+                1.0,
+            ));
+            self.fade_out = None;
+        }
+        self.last_visible = vis;
+
         // 录音：电平广播 + 60s 上限
         if let Some(rec) = &self.recorder {
             let l = rec.level();
@@ -858,8 +1053,36 @@ impl eframe::App for VccApp {
             }
         }
 
-        // ESC 快速收起（课堂场景一键隐藏；agent 后台继续跑）
+        // ESC：先播 150ms 淡出（面板 Fragment 退出），动画完成后再真正隐藏
+        // （课堂场景一键收起；agent 后台继续跑）
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.cfg.reduce_motion {
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                    if self.hwnd != 0 {
+                        let _ = ShowWindow(
+                            windows::Win32::Foundation::HWND(self.hwnd as _),
+                            SW_HIDE,
+                        );
+                    }
+                }
+                self.ctl.main_visible.store(false, Ordering::SeqCst);
+            } else if self.fade_out.is_none() {
+                self.fade_out = Some(Anim::new(
+                    motion::PANEL_OUT_MS,
+                    motion::curve::M3_EMPH_ACCELERATE,
+                    0.0,
+                    1.0,
+                ));
+            }
+        }
+        if self
+            .fade_out
+            .as_ref()
+            .is_some_and(|a| a.done())
+        {
+            self.fade_out = None;
             #[cfg(windows)]
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
@@ -874,27 +1097,96 @@ impl eframe::App for VccApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let th = theme(self.dark);
-        // 侧栏
+
+        // ---- 设置浮层动画推进（250ms 进 / 150ms 出，出完才真正关） ----
+        let settings_closing_done = self
+            .settings_anim
+            .as_ref()
+            .is_some_and(|(opening, a)| a.done() && !*opening);
+        if settings_closing_done {
+            self.show_settings = false;
+            self.settings_anim = None;
+        }
+
+        // ---- 主窗口入场/退场进度（1 = 正常态） ----
+        if self.intro.as_ref().is_some_and(|a| a.done()) {
+            self.intro = None;
+        }
+        let fade_active = self.intro.is_some() || self.fade_out.is_some();
+        let fade = if let Some(a) = &self.intro {
+            a.progress()
+        } else if let Some(a) = &self.fade_out {
+            1.0 - a.progress()
+        } else {
+            1.0
+        };
+
+        // ---- COUI 面板 Fragment 进出场：整层微缩放 + 下浮 ----
+        // 进场 350ms：scale 0.97→1 + translateY 10px→0（从背景浮现遮罩见下）
+        let mut panel_layers: Vec<egui::LayerId> = Vec::new();
         egui::Panel::left("sidebar")
             .exact_size(261.0)
             .frame(egui::Frame::default().fill(th.bg).inner_margin(0.0))
-            .show(ui, |ui| self.sidebar(ui));
+            .show(ui, |ui| {
+                panel_layers.push(ui.layer_id());
+                self.sidebar(ui);
+            });
         // 输入条
         egui::Panel::bottom("input")
             .frame(egui::Frame::default().fill(th.bg))
-            .show(ui, |ui| self.input_bar(ui));
+            .show(ui, |ui| {
+                panel_layers.push(ui.layer_id());
+                self.input_bar(ui);
+            });
         // 消息流
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(th.bg).inner_margin(egui::Margin::symmetric(0, 8)))
-            .show(ui, |ui| self.message_view(ui));
+            .show(ui, |ui| {
+                panel_layers.push(ui.layer_id());
+                self.message_view(ui);
+            });
+
+        if fade_active {
+            let sr = ctx.viewport_rect();
+            let c = sr.center();
+            // TSTransform：global = scaling * local + translation；缩放围绕窗口中心
+            let scaling = 0.97 + 0.03 * fade;
+            let tr = egui::emath::TSTransform {
+                scaling,
+                translation: c.to_vec2() - scaling * c.to_vec2()
+                    + egui::vec2(0.0, 10.0 * (1.0 - fade)),
+            };
+            for lid in &panel_layers {
+                ctx.set_transform_layer(*lid, tr);
+            }
+            // 从背景色浮现：顶层 bg 色遮罩 alpha (1-fade)*0.55
+            egui::Area::new(egui::Id::new("win_fade"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(sr.min)
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    ui.painter()
+                        .rect_filled(sr, 0.0, motion::scrim(th.bg, (1.0 - fade) * 0.55));
+                });
+            motion::repaint_tick(&ctx);
+        } else {
+            let idt = egui::emath::TSTransform::IDENTITY;
+            for lid in &panel_layers {
+                ctx.set_transform_layer(*lid, idt);
+            }
+        }
 
         if self.show_settings {
             self.settings_ui(&ctx);
         }
 
-        // 流式/录音期间持续重绘
-        if self.stream_text.is_some() || self.recorder.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // 流式/录音/气泡入场期间持续重绘
+        if self.stream_text.is_some()
+            || self.recorder.is_some()
+            || !self.entering.is_empty()
+            || self.settings_anim.is_some()
+        {
+            motion::repaint_tick(&ctx);
         }
     }
 }
@@ -1028,4 +1320,6 @@ fn apply_visuals(ctx: &egui::Context, dark: bool) {
     v.widgets.inactive.bg_fill = th.input_bg;
     v.widgets.hovered.bg_fill = th.row_hover;
     ctx.set_visuals(v);
+    // COUI 交互时长：egui 内置动画统一 150ms
+    ctx.all_styles_mut(|style| style.animation_time = 0.15);
 }

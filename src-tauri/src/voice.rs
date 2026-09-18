@@ -1,16 +1,17 @@
 /* ---------- 语音识别：whisper-server 常驻 + CLI 兜底 ---------- */
-/* v0.4.0 效率重构：
-   1. 常驻 whisper-server（模型只加载一次，免去每次识别 2-8s 的进程冷启动+模型加载）
-   2. 量化模型 q5_1（487MB -> 180MB，推理更快，学校低配设备友好）
-   3. 参数调优：greedy 解码（-bs 1 -bo 1）、中文 prompt、无时间戳
-   4. server.json 记录 port/pid/model —— 旧实例孤儿 server 可被新实例复用，防重复驻留
-   5. server 两连失败自动降级 CLI（保底可用性） */
 
 use base64::Engine;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU16, Ordering};
-use tokio::process::Command;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::process::{Child, Command};
+
+const MAX_AUDIO_BYTES: usize = 16_000 * 2 * 60;
+const MAX_WAV_BYTES: usize = MAX_AUDIO_BYTES + 65_536;
+const MAX_BASE64_BYTES: usize = ((MAX_WAV_BYTES + 2) / 3) * 4;
+const CLI_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 从 exe 目录逐级向上查找项目内的工具文件（dev 与打包布局都兼容）
 pub fn find_tool(rel: &str) -> Option<PathBuf> {
@@ -26,9 +27,8 @@ pub fn find_tool(rel: &str) -> Option<PathBuf> {
     None
 }
 
-/* ---------- 模型档位 ---------- */
+/* ---------- 模型档位与公共参数 ---------- */
 
-/// fast = q5_1 量化（默认，学校设备友好）；quality = fp16 原版
 fn model_file(tier: &str) -> &'static str {
     match tier {
         "quality" => "ggml-small.bin",
@@ -37,460 +37,512 @@ fn model_file(tier: &str) -> &'static str {
 }
 
 fn resolve_model(tier: &str) -> Option<PathBuf> {
-    let name = model_file(tier);
-    if let Some(p) = find_tool(&format!("tools/models/{name}")) {
-        return Some(p);
-    }
-    // 档位文件缺失时回退另一档
-    let alt = if name == "ggml-small-q5_1.bin" { "ggml-small.bin" } else { "ggml-small-q5_1.bin" };
-    find_tool(&format!("tools/models/{alt}"))
+    let (dir, name) = model_dir_and_name(tier)?;
+    Some(dir.join(name))
 }
 
-/// 模型目录 + 纯 ASCII 相对文件名。
-/// whisper 二进制按 UTF-8 解释 argv：绝对路径含中文时（GBK 字节非法 UTF-8）
-/// whisper_model_load 直接 fail-fast（0xC0000409），因此模型必须以相对名传入。
+/// 模型以 cwd + ASCII 相对文件名传入，规避 Windows 非 ASCII argv 问题。
 fn model_dir_and_name(tier: &str) -> Option<(PathBuf, String)> {
     let name = model_file(tier);
     if let Some(p) = find_tool(&format!("tools/models/{name}")) {
         return Some((p.parent()?.to_path_buf(), name.to_string()));
     }
-    // 档位文件缺失时回退另一档
-    let alt = if name == "ggml-small-q5_1.bin" { "ggml-small.bin" } else { "ggml-small-q5_1.bin" };
+    let alt = if name == "ggml-small-q5_1.bin" {
+        "ggml-small.bin"
+    } else {
+        "ggml-small-q5_1.bin"
+    };
     let p = find_tool(&format!("tools/models/{alt}"))?;
     Some((p.parent()?.to_path_buf(), alt.to_string()))
 }
 
 fn whisper_dir() -> Option<PathBuf> {
-    find_tool("tools/whisper/Release/whisper-cli.exe").map(|p| p.parent().unwrap().to_path_buf())
+    find_tool("tools/whisper/Release/whisper-cli.exe")
+        .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-/* ---------- 通用参数 ---------- */
+fn language(cfg: &crate::config::Config) -> &str {
+    if cfg.voice_lang.trim().is_empty() {
+        "zh"
+    } else {
+        cfg.voice_lang.trim()
+    }
+}
 
-/// 中文识别的公共调优参数（CLI 与 server 共用的语义）
-/// -l zh 固定语言（跳过自动检测）；--prompt 中文引导；-nt 无时间戳
-fn common_args(cfg: &crate::config::Config, out: &mut Vec<String>) {
-    let lang = if cfg.voice_lang.is_empty() { "zh" } else { cfg.voice_lang.as_str() };
-    if lang != "auto" {
-        out.push("-l".into()); out.push(lang.into());
-    } // auto：省略 -l 让 whisper 自动检测（略慢）
-    // greedy 解码：beam=1 best=1，对 3-15s 短指令基本无损，速度显著提升
-    out.push("-bs".into()); out.push("1".into());
-    out.push("-bo".into()); out.push("1".into());
-    // 注意：不再经 argv 传中文 prompt——argv 经 CRT 转 GBK 后被 whisper 按 UTF-8
-    // 解释成乱码（还可能触发 fail-fast）。server 模式的 prompt 改走 HTTP 表单（UTF-8 安全）。
-    // 线程数：手动配置优先；否则按逻辑核一半自适应（低配设备留核保系统流畅，clamp 2-4）
-    let t = if cfg.voice_threads > 0 {
+fn threads(cfg: &crate::config::Config) -> i32 {
+    if cfg.voice_threads > 0 {
         cfg.voice_threads
     } else {
         let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         (n / 2).clamp(2, 4) as i32
-    };
-    if t > 0 {
-        out.push("-t".into()); out.push(t.to_string());
     }
+}
+
+fn common_args(lang: &str, threads: i32, out: &mut Vec<String>) {
+    // auto 必须显式传入，whisper 的默认语言不一定是自动检测。
+    out.extend([
+        "-l".into(), lang.into(),
+        "-bs".into(), "1".into(),
+        "-bo".into(), "1".into(),
+        "-t".into(), threads.to_string(),
+    ]);
 }
 
 /* ---------- server 管理 ---------- */
 
 static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
-static SERVER_LAST_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn touch_server() {
-    SERVER_LAST_USED.store(now_secs(), Ordering::Relaxed);
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 struct ServerInfo {
     port: u16,
     pid: u32,
     model: String,
     #[serde(default)]
     lang: String,
+    // 旧记录没有线程数，不能作为匹配的缓存使用。
+    #[serde(default)]
+    threads: i32,
 }
 
-fn server_info_path() -> Option<PathBuf> {
-    Some(crate::config::data_dir().join("server.json"))
+fn cache_matches(info: &ServerInfo, actual_model: &str, lang: &str, threads: i32) -> bool {
+    info.port != 0 && info.model == actual_model && info.lang == lang && info.threads == threads
+}
+
+struct ServerState {
+    info: Option<ServerInfo>,
+    child: Option<Child>,
+    last_used: Option<Instant>,
+}
+
+// 锁不仅覆盖检查/启动，还覆盖一次 HTTP 推理及失败失效操作。
+static ENSURING: tokio::sync::Mutex<ServerState> = tokio::sync::Mutex::const_new(ServerState {
+    info: None,
+    child: None,
+    last_used: None,
+});
+
+struct ServerLease {
+    state: tokio::sync::MutexGuard<'static, ServerState>,
+}
+
+impl Drop for ServerLease {
+    fn drop(&mut self) {
+        // 成功、错误、select 取消都从实际释放租约的时刻开始计算空闲时间。
+        self.state.last_used = self.state.info.as_ref().map(|_| Instant::now());
+    }
+}
+
+fn server_info_path() -> PathBuf {
+    crate::config::data_dir().join("server.json")
 }
 
 fn read_server_info() -> Option<ServerInfo> {
-    let p = server_info_path()?;
-    let s = std::fs::read_to_string(p).ok()?;
-    serde_json::from_str(&s).ok()
+    let mut text = String::new();
+    std::fs::File::open(server_info_path()).ok()?.take(8193).read_to_string(&mut text).ok()?;
+    if text.len() > 8192 { return None; }
+    serde_json::from_str(&text).ok()
 }
 
 fn write_server_info(info: &ServerInfo) {
-    if let Some(p) = server_info_path() {
-        if let Ok(j) = serde_json::to_string(info) {
-            let _ = std::fs::write(p, j);
+    if let Ok(json) = serde_json::to_string(info) {
+        let _ = std::fs::write(server_info_path(), json);
+    }
+}
+
+/// 只终止本进程持有句柄的子进程；绝不根据 server.json 中的 PID 杀进程。
+fn stop_server(state: &mut ServerState) {
+    let previous = state.info.take();
+    SERVER_PORT.store(0, Ordering::Relaxed);
+    state.last_used = None;
+    if let Some(mut child) = state.child.take() {
+        let _ = child.start_kill();
+        // kill_on_drop 兜底，Tokio 负责子进程回收。
+        drop(child);
+        if previous.is_some() && read_server_info() == previous {
+            let _ = std::fs::remove_file(server_info_path());
         }
     }
 }
 
-fn kill_pid(pid: u32) {
-    #[cfg(windows)]
+async fn probe(port: u16) -> bool {
+    // 任意 HTTP 响应不代表 whisper；仅接受健康接口的 JSON 成功响应。
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(2))
+        .build()
     {
-        use std::os::windows::process::CommandExt;
-        // 先验明正身：server.json 里的 pid 可能已被系统复用，盲杀会误伤无关进程
-        let is_ours = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .creation_flags(0x08000000)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("whisper-server"))
-            .unwrap_or(false);
-        if !is_ours {
-            return;
-        }
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .creation_flags(0x08000000)
-            .output();
-    }
-}
-
-/// 探活：有 HTTP 响应（任意状态码）即认为 server 活着
-fn probe(port: u16) -> bool {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-    let addr = format!("127.0.0.1:{port}");
-    let ok: std::net::SocketAddr = match addr.parse() {
-        Ok(a) => a,
+        Ok(client) => client,
         Err(_) => return false,
     };
-    TcpStream::connect_timeout(&ok, Duration::from_secs(2))
-        .map(|mut s| {
-            // TCP 通了还不够稳，发一个最小 HTTP 请求确认是我们的 server；
-            // 端口被其他程序占用时超时退出，不能在 async 上下文里无限阻塞
-            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-            let _ = s.write_all(format!("GET / HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes());
-            let mut buf = [0u8; 16];
-            matches!(s.read(&mut buf), Ok(n) if n > 0)
-        })
-        .unwrap_or(false)
+    let response = match client.get(format!("http://127.0.0.1:{port}/health")).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    match response_text(response, 4096).await {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .is_some_and(|value| value.get("status").and_then(|s| s.as_str()) == Some("ok")),
+        Err(_) => false,
+    }
 }
 
-static ENSURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// 确保有可用的 whisper-server，返回端口。复用旧实例（含孤儿），失败则启动新的。
-async fn ensure_server(cfg: &crate::config::Config) -> Result<u16, String> {
-    // 互斥：「检查+启动」全程串行，防止 warmup 与并发 transcribe 各拉起一个 server
-    let _serial = ENSURING.lock().await;
-    let model_name = model_file(cfg.voice_model.as_str()).to_string();
-    let lang = if cfg.voice_lang.is_empty() { "zh".to_string() } else { cfg.voice_lang.clone() };
-
-    // 1. 本进程已知端口
-    let known = SERVER_PORT.load(Ordering::Relaxed);
-    if known != 0 && probe(known) {
-        touch_server();
-        return Ok(known);
-    }
-
-    // 2. 跨实例复用（server.json：可能是上次实例留下的健康孤儿）
-    if let Some(info) = read_server_info() {
-        if info.model == model_name && info.lang == lang && probe(info.port) {
-            SERVER_PORT.store(info.port, Ordering::Relaxed);
-            touch_server();
-            return Ok(info.port);
-        }
-        // 存在但不健康或档位不符 → 清理
-        kill_pid(info.pid);
-    }
-
-    // 3. 启动新 server（模型以 cwd=models + 相对名传入，规避非 ASCII 路径崩溃）
-    let dir = whisper_dir().ok_or("未找到 tools/whisper/Release/")?;
+async fn ensure_server(cfg: &crate::config::Config, reuse_saved: bool) -> Result<ServerLease, String> {
+    let mut lease = ServerLease { state: ENSURING.lock().await };
+    // 必须先解析回退后的实际文件名，不能使用用户请求的档位名比较缓存。
     let (models_cwd, model_name) = model_dir_and_name(&cfg.voice_model)
         .ok_or("未找到语音模型文件（tools/models/）")?;
+    let lang = language(cfg);
+    let thread_count = threads(cfg);
 
-    // 选空闲端口
+    if let Some(info) = lease.state.info.clone() {
+        let owned_alive = match lease.state.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => true,
+        };
+        if owned_alive && cache_matches(&info, &model_name, lang, thread_count) && probe(info.port).await {
+            return Ok(lease);
+        }
+        stop_server(&mut lease.state);
+    }
+
+    if reuse_saved {
+        if let Some(info) = read_server_info() {
+            if cache_matches(&info, &model_name, lang, thread_count) && probe(info.port).await {
+                SERVER_PORT.store(info.port, Ordering::Relaxed);
+                lease.state.info = Some(info);
+                return Ok(lease);
+            }
+            // 非本进程拥有的旧实例不清理；另选空闲端口，避免 PID 复用误杀。
+        }
+    }
+
+    let dir = whisper_dir().ok_or("未找到 tools/whisper/Release/")?;
     let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        l.local_addr().map_err(|e| e.to_string())?.port()
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        listener.local_addr().map_err(|e| e.to_string())?.port()
     };
-
-    let mut args: Vec<String> = vec![
+    let mut args = vec![
         "-m".into(), model_name.clone(),
         "--host".into(), "127.0.0.1".into(),
-        "--port".into(), port.to_string(),
-        "-nt".into(),
+        "--port".into(), port.to_string(), "-nt".into(),
     ];
-    common_args(cfg, &mut args);
-
-    // stderr 落盘：server 崩溃不再静默，事后可查 whisper-server.log
-    let log_file = std::fs::File::create(
-        crate::config::data_dir().join("whisper-server.log"),
-    )
-    .ok();
-
+    common_args(lang, thread_count, &mut args);
+    let log_file = std::fs::File::create(crate::config::data_dir().join("whisper-server.log")).ok();
     let mut cmd = Command::new(dir.join("whisper-server.exe"));
-    cmd.args(&args)
-        .current_dir(&models_cwd)
+    cmd.args(args)
+        .current_dir(models_cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    match log_file {
-        Some(f) => { cmd.stderr(Stdio::from(f)); }
-        None => { cmd.stderr(Stdio::null()); }
-    }
+        .stdout(Stdio::null())
+        .stderr(log_file.map(Stdio::from).unwrap_or_else(Stdio::null))
+        .kill_on_drop(true);
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd.creation_flags(0x08000000);
+    // 就绪前只由此 future 持有子进程，取消或超时会自动终止，不留下脱管 waiter。
     let mut child = cmd.spawn().map_err(|e| format!("whisper-server 启动失败: {e}"))?;
-    let pid = child.id().unwrap_or(0);
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| format!("读取 server 状态失败: {e}"))? {
+                return Err(format!("whisper-server 启动即退出（{status}，详见 whisper-server.log）"));
+            }
+            if probe(port).await {
+                // 探活期间子进程可能退出，不能将别的端口占用者登记为自己启动的实例。
+                if matches!(child.try_wait(), Ok(None)) { return Ok(()); }
+                return Err("whisper-server 就绪检查时已退出".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await;
+    ready.map_err(|_| "whisper-server 启动超时（详见 whisper-server.log）".to_string())??;
 
-    // 早退检测：进程一退出立即读日志报错，不再傻等 30s
-    let waiter = tokio::spawn(async move { child.wait().await });
-
-    // 等待就绪（模型加载：q5_1 SSD 约 1-3s，HDD/低配机放宽到 30s）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if probe(port) {
-            SERVER_PORT.store(port, Ordering::Relaxed);
-            touch_server();
-            write_server_info(&ServerInfo { port, pid, model: model_name, lang });
-            return Ok(port);
-        }
-        if waiter.is_finished() {
-            let tail = std::fs::read_to_string(
-                crate::config::data_dir().join("whisper-server.log"),
-            )
-            .ok()
-            .map(|s| {
-                    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-                    let start = lines.len().saturating_sub(4);
-                    lines[start..].join(" | ")
-                })
-                .unwrap_or_default();
-            kill_pid(pid);
-            return Err(format!("whisper-server 启动即退出: {tail}"));
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    kill_pid(pid);
-    Err("whisper-server 启动超时（详见配置目录 whisper-server.log）".into())
+    let info = ServerInfo {
+        port, pid: child.id().unwrap_or(0), model: model_name,
+        lang: lang.into(), threads: thread_count,
+    };
+    write_server_info(&info);
+    SERVER_PORT.store(port, Ordering::Relaxed);
+    lease.state.info = Some(info);
+    lease.state.child = Some(child);
+    Ok(lease)
 }
 
-fn stop_server() {
-    let p = SERVER_PORT.swap(0, Ordering::Relaxed);
-    let _ = p;
-    if let Some(info) = read_server_info() {
-        kill_pid(info.pid);
-        if let Some(path) = server_info_path() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// 预热：应用启动后后台静默拉起常驻 server（用户首次说话即热态，无冷启动等待）
 pub async fn warmup() {
     let cfg = crate::config::load();
-    let _ = ensure_server(&cfg).await;
+    let _ = ensure_server(&cfg, true).await;
 }
 
-/// 空闲回收：每 5 分钟检查，30 分钟无识别请求则关闭常驻 server
-/// （低配教室机释放约 500MB 内存；下次语音时 ensure_server 会重新拉起）
+/// 回收检查与启动/推理共享锁，忙碌时跳过；不终止其他应用实例的 server。
 pub fn start_idle_reaper() {
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(300));
-            let last = SERVER_LAST_USED.load(Ordering::Relaxed);
-            if last == 0 {
-                continue; // 从未启动过（或已被回收）
-            }
-            if now_secs().saturating_sub(last) > 1800 {
-                stop_server();
-                SERVER_LAST_USED.store(0, Ordering::Relaxed);
-                eprintln!("vcc: whisper server idle 30min, reclaimed");
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(300));
+        if let Ok(mut state) = ENSURING.try_lock() {
+            if state.last_used.is_some_and(|last| last.elapsed() > Duration::from_secs(1800)) {
+                stop_server(&mut state);
+                eprintln!("vcc: 语音 server 空闲缓存已回收");
             }
         }
     });
 }
 
+/* ---------- WAV 校验与临时文件 ---------- */
+
+/// 严格检查 RIFF 块边界及 PCM 格式，允许合法的附加块和奇数长度块 padding。
+fn validate_wav(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_WAV_BYTES { return Err("录音数据过大，最多支持 60 秒".into()); }
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("录音不是有效的 RIFF/WAV 文件".into());
+    }
+    let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let u16_at = |offset: usize| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+    if u32_at(4) as u64 + 8 != bytes.len() as u64 {
+        return Err("WAV 头声明的文件长度不一致".into());
+    }
+    let mut offset = 12usize;
+    let mut have_fmt = false;
+    let mut have_data = false;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 8 { return Err("WAV 块头不完整".into()); }
+        let len = u32_at(offset + 4) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(len).filter(|end| *end <= bytes.len())
+            .ok_or("WAV 数据块越界或被截断")?;
+        match &bytes[offset..offset + 4] {
+            b"fmt " => {
+                if have_fmt || len < 16 { return Err("WAV 格式块无效或重复".into()); }
+                if u16_at(start) != 1 || u16_at(start + 2) != 1 || u32_at(start + 4) != 16_000
+                    || u32_at(start + 8) != 32_000 || u16_at(start + 12) != 2 || u16_at(start + 14) != 16
+                {
+                    return Err("录音须为 16kHz、单声道、16bit PCM WAV".into());
+                }
+                have_fmt = true;
+            }
+            b"data" => {
+                if !have_fmt || have_data || len == 0 || len % 2 != 0 {
+                    return Err("WAV 音频块为空、重复、顺序或长度无效".into());
+                }
+                if len > MAX_AUDIO_BYTES { return Err("录音超过 60 秒上限".into()); }
+                have_data = true;
+            }
+            _ => {}
+        }
+        offset = end.checked_add(len % 2).filter(|end| *end <= bytes.len())
+            .ok_or("WAV 数据块缺少对齐字节")?;
+    }
+    if !have_fmt || !have_data { return Err("WAV 缺少格式块或音频数据块".into()); }
+    Ok(())
+}
+
+fn read_wav(path: &Path) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("读取录音失败: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_WAV_BYTES as u64 + 1).read_to_end(&mut bytes)
+        .map_err(|e| format!("读取录音失败: {e}"))?;
+    validate_wav(&bytes)?;
+    Ok(bytes)
+}
+
+static WAV_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempWav {
+    path: PathBuf,
+}
+
+impl TempWav {
+    fn create_in(dir: &Path, bytes: &[u8]) -> Result<Self, String> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos();
+        for _ in 0..128 {
+            let path = dir.join(format!("vcc_rec_{}_{}_{}.wav", std::process::id(), stamp,
+                WAV_SEQ.fetch_add(1, Ordering::Relaxed)));
+            let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("创建临时音频失败: {e}")),
+            };
+            let temp = Self { path };
+            let result = file.write_all(bytes);
+            // Windows 下必须先关闭句柄，再让错误路径上的 RAII 删除文件。
+            drop(file);
+            result.map_err(|e| format!("写入临时音频失败: {e}"))?;
+            return Ok(temp);
+        }
+        Err("无法分配唯一的临时音频文件".into())
+    }
+}
+
+impl Drop for TempWav {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() == std::io::ErrorKind::NotFound { return; }
+            // CLI 取消时 kill_on_drop 已发出终止，但 Windows 文件句柄可能尚未释放。
+            // 不依赖被取消的 Tokio future/运行时，有限重试清理唯一的自有文件。
+            let path = self.path.clone();
+            let _ = std::thread::Builder::new().name("vcc-audio-cleanup".into()).spawn(move || {
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                        Err(_) => {}
+                    }
+                }
+                eprintln!("vcc: 临时音频清理失败: {}", path.display());
+            });
+        }
+    }
+}
+
 /* ---------- HTTP 推理 ---------- */
 
-async fn infer_via_server(cfg: &crate::config::Config, port: u16, wav_path: &Path, timeout_secs: u64) -> Result<String, String> {
-    let url = format!("http://127.0.0.1:{port}/inference");
-    let lang = if cfg.voice_lang.is_empty() { "zh".to_string() } else { cfg.voice_lang.clone() };
-    let wav_bytes = std::fs::read(wav_path).map_err(|e| format!("读临时文件失败: {e}"))?;
-    let boundary = "----vccform7d3a";
-    let part = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
-    );
-    // prompt 走 HTTP 表单（UTF-8 安全）；argv 传中文会被 CRT 转 GBK 再按 UTF-8 解释成乱码
-    let prompt_part = if lang == "zh" {
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n以下是普通话的句子。\r\n")
-    } else {
-        String::new()
+/// 纯函数：选取不与载荷碰撞的 boundary，每一部分（包括 WAV）都以 CRLF 结束。
+fn multipart_body(wav: &[u8], lang: &str) -> (String, Vec<u8>) {
+    let mut index = 0u64;
+    let boundary = loop {
+        let candidate = format!("vcc-form-{index:x}");
+        if !wav.windows(candidate.len()).any(|part| part == candidate.as_bytes())
+            && !lang.contains(&candidate)
+        {
+            break candidate;
+        }
+        index += 1;
     };
-    let body = part.into_bytes()
-        .into_iter()
-        .chain(wav_bytes)
-        .chain(prompt_part.into_bytes())
-        .chain(format!("\r\n--{boundary}--\r\n").into_bytes())
-        .collect::<Vec<u8>>();
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("server 请求失败: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("server HTTP {}", resp.status()));
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n").into_bytes();
+    body.extend_from_slice(wav);
+    body.extend_from_slice(b"\r\n");
+    for (name, value) in [("language", lang), ("response_format", "json")] {
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
     }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    // response_format 默认 json：{"text": "..."}
-    let parsed: Option<String> = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from));
-    Ok(parsed.unwrap_or(text).trim().to_string())
+    if lang == "zh" {
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n以下是普通话的句子。\r\n").as_bytes());
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (boundary, body)
+}
+
+fn parse_server_text(body: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| "语音 server 返回的不是合法 JSON".to_string())?;
+    let object = value.as_object().ok_or("语音 server 返回的 JSON 必须是对象")?;
+    if object.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("语音 server 返回了错误，未获得有效转写".into());
+    }
+    object.get("text").and_then(|text| text.as_str()).map(|text| text.trim().to_string())
+        .ok_or_else(|| "语音 server 返回的 JSON 缺少字符串 text 字段".into())
+}
+
+async fn response_text(mut response: reqwest::Response, limit: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("读取 server 响应失败: {e}"))? {
+        if chunk.len() > limit - bytes.len() { return Err("语音 server 响应过大".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "语音 server 响应不是 UTF-8".into())
+}
+
+async fn infer_via_server(cfg: &crate::config::Config, port: u16, wav_path: &Path, timeout_secs: u64) -> Result<String, String> {
+    let wav = read_wav(wav_path)?;
+    let (boundary, body) = multipart_body(&wav, language(cfg));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(timeout_secs))
+        .build().map_err(|e| e.to_string())?;
+    let response = client.post(format!("http://127.0.0.1:{port}/inference"))
+        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .body(body).send().await.map_err(|e| format!("server 请求失败: {e}"))?;
+    if !response.status().is_success() { return Err(format!("server HTTP {}", response.status())); }
+    parse_server_text(&response_text(response, 65_536).await?)
 }
 
 /* ---------- CLI 兜底 ---------- */
 
 pub async fn infer_via_cli(cfg: &crate::config::Config, wav_path: &Path) -> Result<String, String> {
+    let bytes = read_wav(wav_path)?;
     let dir = whisper_dir().ok_or("未找到 tools/whisper/Release/")?;
     let (models_cwd, model_name) = model_dir_and_name(&cfg.voice_model)
         .ok_or("未找到语音模型文件（tools/models/）")?;
-
-    // wav 路径同样须 ASCII：临时目录含非 ASCII（如中文用户名）时拷入模型目录用相对名
-    let mut wav_arg = wav_path.to_string_lossy().into_owned();
-    let mut copied: Option<PathBuf> = None;
-    if wav_arg.chars().any(|c| (c as u32) > 127) {
-        let alt = models_cwd.join("vcc_rec_tmp.wav");
-        if std::fs::copy(wav_path, &alt).is_ok() {
-            wav_arg = "vcc_rec_tmp.wav".into();
-            copied = Some(alt);
-        }
-    }
-
-    let mut args: Vec<String> = vec![
-        "-m".into(), model_name,
-        "-f".into(), wav_arg,
-    ];
-    common_args(cfg, &mut args);
+    // 相对路径也复制，避免改变 cwd 后引用错文件；复制失败直接报告，不回退固定文件名。
+    let copied = if !wav_path.is_absolute() || !wav_path.to_str().is_some_and(str::is_ascii) {
+        Some(TempWav::create_in(&models_cwd, &bytes)?)
+    } else {
+        None
+    };
+    let wav_arg = match &copied {
+        Some(temp) => temp.path.file_name().unwrap().to_string_lossy().into_owned(),
+        None => wav_path.to_string_lossy().into_owned(),
+    };
+    let mut args = vec!["-m".into(), model_name, "-f".into(), wav_arg];
+    common_args(language(cfg), threads(cfg), &mut args);
     args.push("-np".into());
-
     let mut cmd = Command::new(dir.join("whisper-cli.exe"));
-    cmd.args(&args)
-        .current_dir(&models_cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).current_dir(models_cwd)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
-    let out = match cmd.output().await {
-        Ok(o) => o,
-        Err(e) => {
-            if let Some(c) = &copied { let _ = std::fs::remove_file(c); }
-            return Err(format!("whisper 启动失败: {e}"));
-        }
-    };
-    if let Some(c) = &copied { let _ = std::fs::remove_file(c); }
+    let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await
+        .map_err(|_| "语音识别超过 90 秒，已终止 CLI".to_string())?
+        .map_err(|e| format!("whisper 启动失败: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let tail: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-        let start = tail.len().saturating_sub(5);
-        let joined = tail[start..].join(" | ");
+        let error = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = error.lines().filter(|line| !line.trim().is_empty()).collect();
+        let detail = lines[lines.len().saturating_sub(5)..].join(" | ");
         let code = out.status.code().unwrap_or(0) as u32;
-        return Err(format!("whisper 运行失败(0x{code:08X}): {joined}"));
+        return Err(format!("whisper 运行失败(0x{code:08X}): {detail}"));
     }
-    let text = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = String::from_utf8_lossy(&out.stdout).lines().map(str::trim)
+        .filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
     Ok(text.trim().to_string())
 }
 
 /* ---------- 对外入口 ---------- */
 
-/// base64(WAV 16k mono) -> 文本。server 常驻优先，两连失败降级 CLI。
 pub async fn transcribe(wav_base64: &str) -> Result<String, String> {
     use base64::engine::general_purpose::STANDARD;
-
-    touch_server();
-    let bytes = STANDARD
-        .decode(wav_base64.trim())
-        .map_err(|e| format!("WAV 解码失败: {e}"))?;
-    if bytes.len() < 100 {
-        return Err("录音数据为空".into());
-    }
-
-    static WAV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "vcc_rec_{}_{}.wav",
-        std::process::id(),
-        WAV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
-
+    // 解码前限制分配量（含外围空白），解码后再校验头和实际音频时长。
+    if wav_base64.len() > MAX_BASE64_BYTES { return Err("录音数据过大，最多支持 60 秒".into()); }
+    let bytes = STANDARD.decode(wav_base64.trim()).map_err(|e| format!("WAV 解码失败: {e}"))?;
+    validate_wav(&bytes)?;
+    let temp = TempWav::create_in(&std::env::temp_dir(), &bytes)?;
     let cfg = crate::config::load();
-
-    let result = transcribe_inner(&cfg, &tmp).await;
-    let _ = std::fs::remove_file(&tmp);
-    result
+    // temp 由 future 持有：包括 select 取消，任意退出路径都会执行 Drop。
+    transcribe_inner(&cfg, &temp.path).await
 }
 
 async fn transcribe_inner(cfg: &crate::config::Config, tmp: &Path) -> Result<String, String> {
-    // 1. 常驻 server（首次调用会启动并等模型加载，之后复用）
     for attempt in 0..2 {
-        match ensure_server(cfg).await {
-            Ok(port) => match infer_via_server(cfg, port, tmp, 60).await {
-                Ok(t) => return finalize_text(t),
-                Err(e) => {
-                    if attempt == 0 {
-                        // server 可能死掉/卡死：清理后重启重试一次
-                        stop_server();
-                        continue;
+        match ensure_server(cfg, attempt == 0).await {
+            Ok(mut lease) => {
+                let port = lease.state.info.as_ref().unwrap().port;
+                match infer_via_server(cfg, port, tmp, 60).await {
+                    Ok(text) => return finalize_text(text),
+                    Err(error) => {
+                        // 失效的是当前租约的实例，不会清掉另一请求刚启动的 server。
+                        stop_server(&mut lease.state);
+                        eprintln!("server 推理失败（第 {} 次）: {error}", attempt + 1);
                     }
-                    eprintln!("server 推理失败（已重试）: {e}");
                 }
-            },
-            Err(e) => {
-                eprintln!("server 启动失败（attempt {attempt}）: {e}");
+            }
+            Err(error) => {
+                eprintln!("server 启动失败: {error}");
                 break;
             }
         }
     }
-    // 2. CLI 兜底
-    let t = infer_via_cli(cfg, tmp).await?;
-    finalize_text(t)
+    finalize_text(infer_via_cli(cfg, tmp).await?)
 }
 
-fn finalize_text(t: String) -> Result<String, String> {
-    let t = t.trim().to_string();
-    Ok(t)
+fn finalize_text(text: String) -> Result<String, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() { return Err("未识别到有效语音，请靠近麦克风后重试".into()); }
+    Ok(text)
 }
 
-
-
-/// 预热检查 + 基准（诊断用）
+/// 仅检查工具路径与缓存端口，不启动录音或推理。
 pub fn probe_env() -> Result<String, String> {
     let cli = whisper_dir().ok_or("tools/whisper/Release/ 未找到")?;
     let fast = resolve_model("fast").map(|p| p.display().to_string()).unwrap_or_default();
     let quality = resolve_model("quality").map(|p| p.display().to_string()).unwrap_or_default();
-    Ok(format!(
-        "whisper: {}\nfast(q5_1): {}\nquality(fp16): {}\nserver: 端口 {}",
-        cli.display(),
-        fast,
-        quality,
-        SERVER_PORT.load(Ordering::Relaxed)
-    ))
+    Ok(format!("whisper: {}\nfast(q5_1): {}\nquality(fp16): {}\nserver: 端口 {}",
+        cli.display(), fast, quality, SERVER_PORT.load(Ordering::Relaxed)))
 }

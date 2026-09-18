@@ -517,7 +517,7 @@ unsafe fn pump_win(rx: Receiver<PumpMsg>, ev: EventTx) {
     }
 
     // 托盘 + 热键
-    let mut tray_hotkey = setup_tray_hotkey();
+    let tray_hotkey = setup_tray_hotkey();
     if let Err(e) = &tray_hotkey {
         eprintln!("vcc: 托盘/热键初始化失败: {e}");
     }

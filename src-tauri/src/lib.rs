@@ -3,6 +3,7 @@ pub mod config;
 pub mod llm;
 pub mod md;
 pub mod memory;
+pub mod motion;
 pub mod overlay;
 pub mod recorder;
 pub mod tools;

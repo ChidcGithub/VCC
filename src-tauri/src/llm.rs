@@ -481,7 +481,7 @@ pub async fn run_agent(state: &crate::VccState, ev: &EventTx, text: String) -> R
             let mut hist = state.history.lock().map_err(|_| "历史锁错误")?;
             hist.push(ChatMessage::text("assistant", &answer));
             // 落盘：重启后恢复对话流
-            crate::memory::save_history(&hist);
+            let _ = crate::memory::save_history(&hist);
         }
         // 纯工具调用无文本输出时，主窗口补一个完成气泡
         if answer.trim().is_empty() || answer == "（已完成）" {
@@ -506,7 +506,7 @@ pub async fn run_agent(state: &crate::VccState, ev: &EventTx, text: String) -> R
                 .unwrap_or(false);
             if is_ours {
                 hist.pop();
-                crate::memory::save_history(&hist);
+                let _ = crate::memory::save_history(&hist);
             }
         }
     }
